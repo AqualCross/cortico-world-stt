@@ -1,0 +1,40 @@
+{
+  "tools": [
+    {
+      "name": "stt_transcribe",
+      "description": "Transcribe an audio file to text (batch, not realtime). The audio comes from a local file path or a log:/mem: handle; the text is saved to the transcript list.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "audio": {
+            "type": "string",
+            "description": "Audio file path (absolute, or relative to the bot workspace) or a log:/mem: handle."
+          },
+          "note": {
+            "type": "string",
+            "description": "Short label for the transcript list."
+          },
+          "language": {
+            "type": "string",
+            "description": "Language code such as zh / en; overrides the configured hints."
+          },
+          "context": {
+            "type": "string",
+            "description": "Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope qwen-audio-3.x and openai only.)"
+          }
+        },
+        "required": [
+          "audio"
+        ]
+      },
+      "tags": [
+        "read"
+      ],
+      "summary": {
+        "zh": "把一个音频文件（或 log:/mem: 句柄）转写成文字，记进转写记录并交回对话。",
+        "en": "Transcribe an audio file (or a log:/mem: handle) to text; the text is saved to the transcript list and returned to the conversation."
+      }
+    }
+  ],
+  "events": []
+}

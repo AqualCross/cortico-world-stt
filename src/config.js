@@ -1,7 +1,7 @@
 /**
  * 语音转文本的配置段与文案。
  *
- * 段名是 `config.json` 的 `worlds.stt`。控制台热改就地写这个对象，
+ * 段名是 `config.json` 的 `worlds.stt`。WebUI 热改就地写这个对象，
  * World 每次用时现读，所以这里只有默认值与 schema，不持有副本。
  */
 
@@ -136,7 +136,7 @@ export function text(language = 'zh') {
   return language === 'en' ? EN : ZH;
 }
 
-/** 控制台的配置组；路径必须落在 `worlds.stt.` 段内，且每个键都在 DEFAULTS 里有对应项。 */
+/** WebUI 的配置组；路径必须落在 `worlds.stt.` 段内，且每个键都在 DEFAULTS 里有对应项。 */
 export function configGroup(language = 'zh') {
   const t = text(language).config;
   const K = `worlds.${ID}`;

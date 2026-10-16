@@ -2,7 +2,7 @@
 
 给 Coopanion 桌宠加一件事：**把音频文件转写成文字**。支持两种接口形状（阿里云百炼 Qwen-ASR 同步转写，与 OpenAI 兼容的 `/v1/audio/transcriptions`，后者可以接本地 whisper 服务），文字记进可浏览的转写记录，全文随工具回执交回对话。
 
-这是一个 `cortico` 的 **World 扩展**（`kind: world`，`api: 5`），只补一个 `stt` 世界，
+这是一个 `cortico` 的 **World 扩展**（`kind: world`，`api: 6`），只补一个 `stt` 世界，
 不依赖任何第三方 npm 包（纯 ESM JS + Node 内置模块）。
 
 > **它不采集声音、不做实时监听、不做语音切分、不做流式。** 没有麦克风，没有常驻进程：
@@ -245,17 +245,19 @@ node tools/live.mjs        # 可加 LIVE_PROTOCOL / LIVE_BASE_URL / LIVE_MODEL /
 
 ```
 cortico-world-stt/
-├─ package.json        # cortico: { kind: world, api: 5, displayName: 语音转文本, consoleClient: dist/console.js }
+├─ package.json        # cortico: { kind: world, api: 6, displayName: 语音转文本, webUiClient: dist/webui.js, describe: describe.json }
+├─ describe.json       # 自描述：工具与事件（pnpm describe:extension 生成，扩展市场与 check:extension 读它）
+├─ CHANGELOG.md        # 每个版本一节，扩展市场按版本显示更新说明
 ├─ README.md
 ├─ src/
 │  ├─ index.js         # 入口：default 导出 WorldDefinition
-│  ├─ definition.js    # id/label/defaults/preflight/create
+│  ├─ definition.js    # id/label/defaults/preflight/create/describe
 │  ├─ config.js        # worlds.stt 默认值、中英文案、配置组 schema
-│  ├─ world.js         # SttWorld：工具、控制台面板、流式推送、生命周期
+│  ├─ world.js         # SttWorld：工具、WebUI 面板、流式推送、生命周期
 │  ├─ api.js           # 两种接口形状的 HTTP 客户端：请求体、错误归一化、mime 嗅探
 │  ├─ transcripts.js   # 转写仓库：目录 + index.json（只存文本与元数据）
 │  └─ wav.js           # WAV 时长/采样率解析、KB/时长文案、离线样本
-├─ dist/console.js     # 浏览器侧面板 bundle（export default { panels }）
+├─ dist/webui.js       # 浏览器侧面板 bundle（export default { panels }）
 └─ tools/
    ├─ check.mjs        # 离线检查
    ├─ drymount.mts     # 用框架自带判据跑 dry-mount

@@ -1,7 +1,7 @@
 /**
- * 语音转文本的控制台面板（浏览器侧 bundle）。
+ * 语音转文本的 WebUI 面板（浏览器侧 bundle）。
  *
- * 宿主按 `/assets/extensions/<包>/<版本>/dist/console.js` 取这个文件，
+ * 宿主按 `/assets/extensions/<包>/<版本>/dist/webui.js` 取这个文件，
  * 直接 `import()` 它的 default 导出；所以它是纯浏览器 ES 模块：
  * 不 import 任何东西（`cortico/*` 在这里只允许 `import type`），只用 ctx.ui。
  */

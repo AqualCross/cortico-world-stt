@@ -5,7 +5,7 @@
  * 覆盖：清单与声明 / 工具声明 / 配置组路径 / 面板声明 / WAV 工具 /
  * 转写记录仓库（入库、索引、裁剪、坏索引容错）/ 接口客户端（打桩 fetch，两种
  * DashScope 请求体 + OpenAI 兼容 multipart）/ 工具整条链（打桩 fetch、打桩宿主）/
- * 控制台 bundle 的导出形状。
+ * WebUI bundle 的导出形状与自描述。
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -44,6 +44,16 @@ async function checkAsync(label, fn) {
   } catch (err) {
     bad(`${label} — ${err?.message ?? err}`);
   }
+}
+
+/** 键序无关的 JSON 形态：对比 describe.json 与代码里的声明（与框架的深比较等价）。 */
+function stable(value) {
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stable(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -106,15 +116,26 @@ try {
   // -------------------------------------------------------------------------
   console.log('清单与声明');
 
-  check('package.json 的 cortico 段与 consoleClient', () => {
+  check('package.json 的 cortico 段与 webUiClient', () => {
     const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
     eq(manifest.name, 'cortico-world-stt', 'name');
     eq(manifest.cortico?.kind, 'world', 'kind');
-    eq(manifest.cortico?.api, 5, 'api');
+    eq(manifest.cortico?.api, 6, 'api');
     eq(manifest.cortico?.displayName, '语音转文本', 'displayName');
-    assert(typeof manifest.cortico?.consoleClient === 'string' && manifest.cortico.consoleClient, '缺 consoleClient');
-    assert(existsSync(join(pkgDir, manifest.cortico.consoleClient)), 'consoleClient 文件不在包里');
+    assert(typeof manifest.cortico?.webUiClient === 'string' && manifest.cortico.webUiClient, '缺 webUiClient');
+    assert(existsSync(join(pkgDir, manifest.cortico.webUiClient)), 'webUiClient 文件不在包里');
+    eq(manifest.cortico?.describe, 'describe.json', 'describe');
+    assert(existsSync(join(pkgDir, 'describe.json')), 'describe.json 不在包里');
+    assert(Array.isArray(manifest.files) && manifest.files.includes('describe.json'), 'files 缺 describe.json');
     assert(Array.isArray(manifest.keywords) && manifest.keywords.includes('cortico-world'), 'keywords 缺 cortico-world');
+  });
+
+  check('CHANGELOG.md 有当前版本的一节', () => {
+    const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
+    const src = readFileSync(join(pkgDir, 'CHANGELOG.md'), 'utf8');
+    const version = String(manifest.version ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    assert(new RegExp(`^##\\s*\\[?${version}\\]?`, 'm').test(src), `CHANGELOG.md 缺 ## ${manifest.version} 一节`);
+    assert(Array.isArray(manifest.files) && manifest.files.includes('CHANGELOG.md'), 'files 缺 CHANGELOG.md');
   });
 
   check('默认导出是 WorldDefinition', () => {
@@ -126,6 +147,17 @@ try {
     eq(defaults.model, 'qwen-audio-3.1-asr-flash', 'model 默认');
     eq(defaults.maxMb, 7, 'maxMb 默认');
     def.preflight(); // 环境满足时不抛
+  });
+
+  check('describe 与 describe.json 一致，实例工具都在声明里', () => {
+    assert(def.describe && Array.isArray(def.describe.tools) && def.describe.tools.length === 1, '定义缺 describe.tools');
+    assert(Array.isArray(def.describe.events), '定义缺 describe.events');
+    const file = JSON.parse(readFileSync(join(pkgDir, 'describe.json'), 'utf8'));
+    eq(stable(file), stable(JSON.parse(JSON.stringify(def.describe))), 'describe.json 与代码里的 describe 不一致');
+    eq(file.tools[0].name, 'stt_transcribe', 'describe 工具名');
+    eq(file.events.length, 0, '这个 World 不该声明事件');
+    const names = new Set(file.tools.map((t) => t.name));
+    for (const tool of makeWorld().tools()) assert(names.has(tool.name), `工具 ${tool.name} 不在 describe.tools 里`);
   });
 
   check('配置组与默认值一一对应，且都在 worlds.stt 段内', () => {
@@ -144,7 +176,7 @@ try {
   check('不写系统提示词：没有环境段、没有提示词文档', () => {
     const world = makeWorld();
     eq(world.envPromptVars(), null, 'envPromptVars 应为 null');
-    const decl = world.console('zh');
+    const decl = world.webUi('zh');
     assert(!decl.promptDocs || decl.promptDocs.length === 0, '不该再声明提示词文档');
     eq(decl.label, '语音转文本', 'label');
   });
@@ -169,7 +201,7 @@ try {
 
   check('面板与配置组声明', () => {
     const world = makeWorld();
-    const decl = world.console('zh');
+    const decl = world.webUi('zh');
     const ids = decl.panels.map((p) => p.id);
     assert(ids.includes('transcripts') && ids.includes('status'), `面板缺：${ids.join(',')}`);
     assert(Array.isArray(decl.config) && decl.config.length === 1, '缺配置组');
@@ -555,15 +587,15 @@ try {
   });
 
   // -------------------------------------------------------------------------
-  console.log('控制台 bundle');
+  console.log('WebUI bundle');
 
   check('纯 ESM：没有顶层 import', () => {
-    const src = readFileSync(join(pkgDir, 'dist', 'console.js'), 'utf8');
-    assert(!/^\s*import\s/m.test(src), 'console bundle 顶层不该有 import');
+    const src = readFileSync(join(pkgDir, 'dist', 'webui.js'), 'utf8');
+    assert(!/^\s*import\s/m.test(src), 'webui bundle 顶层不该有 import');
   });
 
   await checkAsync('panels 导出形状', async () => {
-    const bundle = await import(pathToFileURL(join(pkgDir, 'dist', 'console.js')).href);
+    const bundle = await import(pathToFileURL(join(pkgDir, 'dist', 'webui.js')).href);
     const panels = bundle.default?.panels ?? {};
     assert(typeof panels.transcripts?.mount === 'function', '缺 transcripts.mount');
     assert(typeof panels.status?.mount === 'function', '缺 status.mount');

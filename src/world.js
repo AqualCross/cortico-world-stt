@@ -25,6 +25,26 @@ import { formatKb, formatSeconds, wavInfo } from './wav.js';
 const msg = (err) => (err instanceof Error ? err.message : String(err));
 const asText = (value) => (typeof value === 'string' ? value.trim() : '');
 
+/** 全部工具的声明（不含 handler）；定义里的 describe 与 `tools()` 都取它。 */
+export const STT_TOOL_DECLS = [
+  {
+    name: 'stt_transcribe',
+    tags: ['read'],
+    interruptible: true,
+    description: 'Transcribe an audio file to text (batch, not realtime). The audio comes from a local file path or a log:/mem: handle; the text is saved to the transcript list.',
+    parameters: {
+      type: 'object',
+      properties: {
+        audio: { type: 'string', description: 'Audio file path (absolute, or relative to the bot workspace) or a log:/mem: handle.' },
+        note: { type: 'string', description: 'Short label for the transcript list.' },
+        language: { type: 'string', description: 'Language code such as zh / en; overrides the configured hints.' },
+        context: { type: 'string', description: 'Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope qwen-audio-3.x and openai only.)' },
+      },
+      required: ['audio'],
+    },
+  },
+];
+
 export class SttWorld {
   #host = null;
   #streams = new Set();
@@ -44,7 +64,7 @@ export class SttWorld {
   }
 
   // -------------------------------------------------------------------------
-  // 配置：config.json 的段被控制台热改，每次用时现读
+  // 配置：config.json 的段被 WebUI 热改，每次用时现读
   // -------------------------------------------------------------------------
 
   #raw(key) {
@@ -178,25 +198,10 @@ export class SttWorld {
   // -------------------------------------------------------------------------
 
   tools() {
-    return [
-      {
-        name: 'stt_transcribe',
-        tags: ['read'],
-        interruptible: true,
-        description: 'Transcribe an audio file to text (batch, not realtime). The audio comes from a local file path or a log:/mem: handle; the text is saved to the transcript list.',
-        parameters: {
-          type: 'object',
-          properties: {
-            audio: { type: 'string', description: 'Audio file path (absolute, or relative to the bot workspace) or a log:/mem: handle.' },
-            note: { type: 'string', description: 'Short label for the transcript list.' },
-            language: { type: 'string', description: 'Language code such as zh / en; overrides the configured hints.' },
-            context: { type: 'string', description: 'Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope qwen-audio-3.x and openai only.)' },
-          },
-          required: ['audio'],
-        },
-        handler: async (args, ctx) => this.#transcribe(args ?? {}, ctx),
-      },
-    ];
+    return [{
+      ...STT_TOOL_DECLS[0],
+      handler: async (args, ctx) => this.#transcribe(args ?? {}, ctx),
+    }];
   }
 
   /** 音频上限（字节）：raw 文件大小；base64 后约 ×1.4。 */
@@ -431,10 +436,10 @@ export class SttWorld {
   }
 
   // -------------------------------------------------------------------------
-  // 控制台
+  // WebUI
   // -------------------------------------------------------------------------
 
-  console(language = 'zh') {
+  webUi(language = 'zh') {
     this.language = language === 'en' ? 'en' : 'zh';
     const t = this.#text();
     const env = this.#envState();
@@ -559,7 +564,7 @@ export class SttWorld {
     return { ok: true, item, ...this.#counts() };
   }
 
-  /** 控制台「试转写」：拿当前配置真转写一个文件，并记进列表。 */
+  /** WebUI「试转写」：拿当前配置真转写一个文件，并记进列表。 */
   async #test(value) {
     const ref = asText(value);
     if (!ref) throw new Error('先选一个音频文件。');
@@ -608,7 +613,7 @@ export class SttWorld {
     const item = this.#storeItem({
       text: res.text,
       note: '控制台试转写',
-      source: { kind: 'console-test', ref: audio.ref },
+      source: { kind: 'webui-test', ref: audio.ref },
       model,
       protocol: res.shape,
       language: res.language ?? '',
