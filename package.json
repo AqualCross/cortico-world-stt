@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-stt",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "语音转文本（Speech to Text）—— 给 Coopanion 桌宠的 cortico World 扩展：把音频文件转写成文字，并记进可浏览的转写记录。 / A cortico World extension that transcribes audio files to text through a configurable ASR API. It is an agent tool, not a realtime microphone.",
   "license": "MIT",

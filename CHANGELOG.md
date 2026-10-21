@@ -2,6 +2,10 @@
 
 每个版本一节 `## <版本号>`；扩展市场按节显示更新说明。
 
+## 0.1.2
+
+- 修复详情页顶部徽标未随面板状态和操作结果同步更新的问题。
+
 ## 0.1.1
 
 - 适配扩展契约 world 6：World 的 `console()` 改名 `webUi()`，manifest 的 `consoleClient` 改为 `webUiClient`，浏览器面板产物改为 `dist/webui.js`。
