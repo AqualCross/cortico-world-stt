@@ -14,6 +14,10 @@
  *
  * 2. `openai` —— OpenAI 兼容的 `/v1/audio/transcriptions`（whisper.cpp、faster-whisper
  *    这类本地服务），multipart 上传，响应里取 `text`。
+ *
+ * 3. `dashscope-async` —— 百炼异步文件转写（模型名带 `-filetrans`）：
+ *    先上传本地音频换 `oss://` 临时 URL，再提交任务，之后轮询任务状态，
+ *    SUCCEEDED 后下载 `transcription_url` 的 JSON。只在 HTTP 上走，不需要公网 URL。
  */
 
 /** 请求失败；`status` 是 HTTP 状态码，0 表示没走到服务端。 */
@@ -120,18 +124,24 @@ function hintsFor(status, code, raw) {
   if (status === 401 || status === 403) return '（密钥不对、没权限，或者这个模型没有开通）';
   if (status === 404) return '（接口地址或模型名不对）';
   if (status === 429) return '（触发限流，等一会儿再试）';
+  if (status === 400 && /please check url|error-url/i.test(s)) {
+    return '（音频地址无效：异步文件转写要公网 URL 或 oss:// 临时地址；同步接口不认 filetrans 模型）';
+  }
   if (status === 400 && /format|audio|decode|duration|size/i.test(s)) {
     return '（音频格式或大小不对：试试 wav / mp3，并确认文件能被正常播放）';
   }
-  if (status === 400 && /model/i.test(s)) return '（模型名不对，或者这个模型没开通）';
+  // 帮助链接里也有 model 字样，判断前先去掉 URL。
+  if (status === 400 && /\bmodel\b/i.test(s.replace(/https?:\/\/\S+/g, ' '))) {
+    return '（模型名不对，或者这个模型没开通）';
+  }
   return '';
 }
 
 /** 异步 POST 一次并解析 JSON；非 2xx 抛 SttApiError，正文带给调用方。 */
-async function postJson(url, { apiKey, body, timeoutMs, signal }) {
-  const headers = { 'Content-Type': 'application/json' };
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const res = await fetchTimed(url, { method: 'POST', headers, body: JSON.stringify(body) }, timeoutMs, signal);
+async function postJson(url, { apiKey, body, headers = {}, timeoutMs, signal }) {
+  const finalHeaders = { 'Content-Type': 'application/json', ...headers };
+  if (apiKey && !finalHeaders.Authorization) finalHeaders.Authorization = `Bearer ${apiKey}`;
+  const res = await fetchTimed(url, { method: 'POST', headers: finalHeaders, body: JSON.stringify(body) }, timeoutMs, signal);
   const text = await res.text();
   let json = null;
   try {
@@ -369,5 +379,193 @@ export async function transcribeByOpenAi(opts = {}) {
     usage: null,
     requestId: '',
     shape: 'openai',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 百炼异步文件转写：上传临时 URL → 提交任务 → 轮询 → 下载结果
+// ---------------------------------------------------------------------------
+
+/** 上传凭证接口在经典域名上；工作空间的 maas 域名不提供它。 */
+export const DASHSCOPE_UPLOAD_BASE = 'https://dashscope.aliyuncs.com';
+export const DASHSCOPE_UPLOAD_PATH = 'api/v1/uploads';
+export const DASHSCOPE_ASYNC_ASR_PATH = 'api/v1/services/audio/asr/transcription';
+
+/** 新加坡地域的凭证接口在另一个域名上；其余按北京。 */
+export function uploadBaseFor(baseUrl) {
+  return /dashscope-intl\.aliyuncs\.com/i.test(String(baseUrl ?? ''))
+    ? 'https://dashscope-intl.aliyuncs.com'
+    : DASHSCOPE_UPLOAD_BASE;
+}
+
+/** OSS 的 key 只留 ASCII 安全字符，扩展名保留。 */
+function safeFileName(name) {
+  const base = String(name ?? '').split(/[/\\]/).pop()?.trim() || 'audio';
+  const dot = base.lastIndexOf('.');
+  const ext = dot > 0 ? base.slice(dot + 1).toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+  const stem = (dot > 0 ? base.slice(0, dot) : base)
+    .replace(/[^\p{L}\p{N}_-]+/gu, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40) || 'audio';
+  return ext ? `${stem}.${ext}` : stem;
+}
+
+/**
+ * 上传本地音频，换一个 48 小时有效的 `oss://` 临时 URL。
+ * @returns {Promise<{fileUrl: string, key: string}>}
+ */
+export async function uploadToDashScope(opts = {}) {
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : DEFAULT_TIMEOUT;
+  const apiKey = String(opts.apiKey ?? '').trim();
+  if (!apiKey) throw new SttApiError('异步转写需要 API Key');
+  const model = String(opts.model ?? '').trim();
+  if (!model) throw new SttApiError('异步转写需要模型名');
+  const bytes = Buffer.isBuffer(opts.bytes) ? opts.bytes : Buffer.from(opts.bytes ?? []);
+  if (!bytes.length) throw new SttApiError('音频是空的，没什么可转写的');
+  const mime = String(opts.mime ?? '').trim() || 'application/octet-stream';
+  const name = safeFileName(opts.name);
+  const base = String(opts.uploadBaseUrl ?? '').trim() || DASHSCOPE_UPLOAD_BASE;
+
+  const policyUrl = joinUrl(base, `${DASHSCOPE_UPLOAD_PATH}?action=getPolicy&model=${encodeURIComponent(model)}`);
+  const policyRes = await fetchTimed(policyUrl, { headers: { Authorization: `Bearer ${apiKey}` } }, timeoutMs, opts.signal);
+  const policyText = await policyRes.text();
+  let policyJson = null;
+  try {
+    policyJson = policyText ? JSON.parse(policyText) : null;
+  } catch {
+    policyJson = null;
+  }
+  if (!policyRes.ok) {
+    const raw = policyJson?.message ?? policyJson?.error?.message ?? policyText;
+    throw new SttApiError(
+      `取上传凭证失败：接口返回 ${policyRes.status}：${snippet(raw, 300)}${hintsFor(policyRes.status, policyJson?.code ?? '', raw)}`,
+      { status: policyRes.status, body: snippet(policyText, 800) },
+    );
+  }
+  const data = policyJson?.data;
+  if (!data?.upload_host || !data?.policy || !data?.signature || !data?.upload_dir || !data?.oss_access_key_id) {
+    throw new SttApiError(`上传凭证缺字段：${snippet(policyText, 300)}`);
+  }
+
+  const key = `${String(data.upload_dir).replace(/\/+$/, '')}/${name}`;
+  const form = new FormData();
+  form.append('OSSAccessKeyId', String(data.oss_access_key_id));
+  form.append('Signature', String(data.signature));
+  form.append('policy', String(data.policy));
+  if (data.x_oss_object_acl) form.append('x-oss-object-acl', String(data.x_oss_object_acl));
+  if (data.x_oss_forbid_overwrite) form.append('x-oss-forbid-overwrite', String(data.x_oss_forbid_overwrite));
+  form.append('key', key);
+  form.append('success_action_status', '200');
+  form.append('file', new Blob([bytes], { type: mime }), name);
+
+  const up = await fetchTimed(String(data.upload_host), { method: 'POST', body: form }, timeoutMs, opts.signal);
+  if (!up.ok) {
+    const raw = await up.text();
+    throw new SttApiError(`上传音频到百炼临时存储失败：HTTP ${up.status}：${snippet(raw, 300)}`, { status: up.status });
+  }
+  return { fileUrl: `oss://${key}`, key };
+}
+
+/**
+ * 提交异步转写任务；只拿 task_id，结果要另外轮询。
+ * @returns {Promise<{taskId: string, requestId: string}>}
+ */
+export async function submitDashScopeAsync(opts = {}) {
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : DEFAULT_TIMEOUT;
+  const model = String(opts.model ?? '').trim();
+  const fileUrl = String(opts.fileUrl ?? '').trim();
+  if (!fileUrl) throw new SttApiError('没有可提交的音频地址');
+  const hints = Array.isArray(opts.languageHints)
+    ? opts.languageHints.map((s) => String(s ?? '').trim()).filter(Boolean).slice(0, 4)
+    : [];
+  const parameters = { channel_id: [0] };
+  if (hints.length) parameters.language_hints = hints;
+
+  let json;
+  try {
+    json = await postJson(joinUrl(opts.baseUrl, DASHSCOPE_ASYNC_ASR_PATH), {
+      apiKey: opts.apiKey,
+      body: { model, input: { file_urls: [fileUrl] }, parameters },
+      headers: { 'X-DashScope-Async': 'enable', 'X-DashScope-OssResourceResolve': 'enable' },
+      timeoutMs,
+      signal: opts.signal,
+    });
+  } catch (err) {
+    if (err instanceof SttApiError && err.status === 404) {
+      throw new SttApiError(
+        `${err.message}（异步文件转写要走百炼工作空间地址，形如 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com）`,
+        { status: err.status, body: err.body },
+      );
+    }
+    throw err;
+  }
+  const taskId = String(json?.output?.task_id ?? '').trim();
+  if (!taskId) throw new SttApiError(`提交成功但没拿到 task_id：${snippet(JSON.stringify(json ?? {}), 300)}`);
+  return { taskId, requestId: String(json?.request_id ?? '') };
+}
+
+/**
+ * 查一次异步任务。
+ * @returns {Promise<{taskId: string, status: string, subtaskStatus: string,
+ *   transcriptionUrl: string, error: string, usage: object|null, requestId: string}>}
+ */
+export async function queryDashScopeTask(opts = {}) {
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : DEFAULT_TIMEOUT;
+  const taskId = String(opts.taskId ?? '').trim();
+  if (!taskId) throw new SttApiError('没有任务号');
+  const url = joinUrl(opts.baseUrl, `api/v1/tasks/${encodeURIComponent(taskId)}`);
+  const res = await fetchTimed(url, {
+    headers: { Authorization: `Bearer ${opts.apiKey}`, 'X-DashScope-OssResourceResolve': 'enable' },
+  }, timeoutMs, opts.signal);
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+  if (!res.ok) {
+    const raw = json?.message ?? json?.error?.message ?? text;
+    throw new SttApiError(
+      `查询任务失败：接口返回 ${res.status}：${snippet(raw, 300)}${hintsFor(res.status, json?.code ?? '', raw)}`,
+      { status: res.status, body: snippet(text, 800) },
+    );
+  }
+  const output = json?.output ?? {};
+  const results = Array.isArray(output.results) ? output.results : [];
+  const first = results[0] ?? null;
+  return {
+    taskId: String(output.task_id ?? taskId),
+    status: String(output.task_status ?? '').toUpperCase(),
+    subtaskStatus: String(first?.subtask_status ?? '').toUpperCase(),
+    transcriptionUrl: String(first?.transcription_url ?? ''),
+    error: first?.code ? `${first.code}: ${first.message ?? ''}` : '',
+    usage: json?.usage && typeof json.usage === 'object' ? json.usage : null,
+    requestId: String(json?.request_id ?? ''),
+  };
+}
+
+/** 下载任务结果 JSON，取 `transcripts[].text`。结果地址是签名 URL，不带鉴权。 */
+export async function fetchDashScopeTranscript(url, opts = {}) {
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : DEFAULT_TIMEOUT;
+  if (!url) throw new SttApiError('任务完成了，但没有给出结果地址');
+  const res = await fetchTimed(url, {}, timeoutMs, opts.signal);
+  if (!res.ok) throw new SttApiError(`下载转写结果失败：HTTP ${res.status}`, { status: res.status });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+  if (!json) throw new SttApiError(`转写结果不是 JSON：${snippet(text, 200)}`);
+  const transcripts = Array.isArray(json.transcripts) ? json.transcripts : [];
+  const body = transcripts.map((it) => String(it?.text ?? '').trim()).filter(Boolean).join('\n');
+  if (!body) throw new SttApiError('转写结果里没有文字');
+  const ms = positiveNumber(json?.properties?.original_duration_in_milliseconds);
+  return {
+    text: body,
+    seconds: ms ? Math.round(ms / 10) / 100 : null,
+    language: typeof json.language === 'string' ? json.language : null,
   };
 }

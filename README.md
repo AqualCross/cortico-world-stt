@@ -69,7 +69,7 @@ pnpm add "D:\path\to\cortico-world-stt" --ignore-workspace
     "stt": {
       "enabled": true,
       "baseUrl": "https://dashscope.aliyuncs.com",
-      "model": "qwen-audio-3.1-asr-flash",
+      "model": "qwen3-asr-flash",
       "apiKeySecret": "AUDIO_API_KEY"
     }
   }
@@ -89,20 +89,33 @@ pnpm add "D:\path\to\cortico-world-stt" --ignore-workspace
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `false` | 是否把 `stt_transcribe` 挂给桌宠 |
-| `protocol` | `dashscope` | `dashscope` = 百炼 Qwen-ASR 同步转写；`openai` = OpenAI 兼容的 `/v1/audio/transcriptions`（本地 whisper.cpp 这类） |
-| `baseUrl` | `https://dashscope.aliyuncs.com` | 接口根地址；百炼的路径是 `/api/v1/services/aigc/multimodal-generation/generation` |
+| `protocol` | `dashscope` | `dashscope` = 百炼 Qwen-ASR 同步转写；`dashscope-async` = 百炼异步文件转写（模型名带 `-filetrans`，提交后由后台轮询发事件）；`openai` = OpenAI 兼容的 `/v1/audio/transcriptions`（本地 whisper.cpp 这类） |
+| `delivery` | `auto` | 结果怎么交回：`wait` = 工具调用里等结果；`event` = 立刻回执，完成后作为事件送达；`auto` = 同步转写等结果、异步文件转写发事件。工具参数 `delivery` 可按次覆盖。 |
+| `baseUrl` | `https://dashscope.aliyuncs.com` | 接口根地址；同步路径是 `/api/v1/services/aigc/multimodal-generation/generation`，异步路径是 `/api/v1/services/audio/asr/transcription`（异步通常要换成工作空间地址，见下文） |
 | `apiKeySecret` | `AUDIO_API_KEY` | 密钥的**变量名**：先看部署 `.env`，再退到 `<bot 目录>/../providers/<端点>/.env` |
-| `model` | `qwen-audio-3.1-asr-flash` | 模型名；`qwen3-asr-*` 与 `qwen-audio-3.x-asr-*` / `fun-asr-*` 请求体不同，插件按名字自动选 |
+| `model` | `qwen3-asr-flash` | 模型名；`qwen3-asr-*` 与 `qwen-audio-3.x-asr-*` / `fun-asr-*` 请求体不同，插件按名字自动选；带 `-filetrans` 的要配 `dashscope-async` |
 | `languageHints` | 空 | 可选语言提示：`zh` / `en` / `ja` 等（多个用逗号分隔；dashscope 最多 4 个，qwen3 只取第一个，openai 兼容只发第一个）；留空自动识别 |
 | `context` | 空 | 可选词表提示：专有名词、术语的**原词**（上下文靠词表匹配生效，写音频里真会说的词，描述性文字帮助有限；≤400 字，重要词放前）；qwen-audio-3.x 与 openai 会发，qwen3 暂不发 |
 | `keepDialect` | `false` | 仅 `dashscope` + `qwen-audio-3.x`：开启后方言按原样转写，关闭转为普通话文本 |
 | `itn` | `false` | 仅 `dashscope` + `qwen3-asr-*`：把「一千零二十」这类口语数字转成 1020、日期规范化（ITN） |
 | `sampleRate` | `0` | 0 = 自动（wav 读文件头）；仅 dashscope 且非 qwen3 会随请求发送 |
 | `maxMb` | `7` | 单次识别的音频大小上限（MB）；base64 后体积约 ×1.4，百炼编码上限 10MB |
-| `timeoutMs` | `120000` | 单次转写（上传 + 识别）的等待上限 |
+| `timeoutMs` | `120000` | 单次转写/轮询的等待上限；异步协议的期限最少按 5 分钟算 |
 | `saveDir` | 空 | 留空 = 本插件数据目录下的 `stt/` |
 | `keep` | `200` | 超出后自动删最旧的记录（只删记录，不碰源文件），`0` = 不清理 |
 | `pushToConsole` | `true` | 转写完实时推给「转写」页 |
+
+### 交付方式
+
+协议（同步 / 异步）和交付（等结果 / 发事件）是两回事，可以任意组合：
+
+| | `wait` | `event` |
+| --- | --- | --- |
+| 同步协议 | 工具调用里直接等到文字（默认） | 后台发请求，完成后发事件 |
+| 异步协议 | 提交后在调用里轮询；到时限转后台 | 提交即回执，轮询完成后发事件（默认） |
+
+`auto` 按协议取上表的默认。工具参数 `delivery` 可以按次覆盖配置；模型自己知道音频多长，让它选就行。
+`event` 下进程重启：异步任务凭任务号接着查；同步请求没法续，启动时发一条 `stt.transcribe-failed`。
 
 ### context 怎么写才有效
 
@@ -178,6 +191,27 @@ pnpm add "D:\path\to\cortico-world-stt" --ignore-workspace
   - `400 InvalidParameter` + 音频字样：格式或大小不对（换成 wav / mp3 再试）；
   - 「接口没给识别结果」：返回 200 但结构里没有文字——多半是模型名与请求体不匹配，换回默认模型对照。
 - **计费**：按音频 token/秒；响应的 `usage`（含 `duration`）会存进记录里。
+
+## 异步文件转写（`protocol: "dashscope-async"`）
+
+模型名带 `-filetrans`（例如 `qwen3-asr-flash-filetrans`）的是异步文件转写：只收公网 URL 或百炼的
+`oss://` 临时地址，提交后排队，结果要轮询。把 `protocol` 填 `dashscope-async`，扩展替你走整条链路：
+
+1. 本地音频上传到百炼临时存储（48 小时有效），换回 `oss://` 地址；
+2. 带 `X-DashScope-Async: enable` 提交任务，拿 `task_id`；
+3. 后台轮询 `/api/v1/tasks/<task_id>`，`SUCCEEDED` 后下载结果 JSON。
+
+`stt_transcribe` 默认只返回「已提交」和任务号，不占住这一轮对话。排队可能几分钟；完成后文字以
+`stt.transcript` 事件送达，失败或超过期限以 `stt.transcribe-failed` 事件送达（异步的期限至少
+5 分钟）。在途任务写在 `stt/pending.json`，应用重启后接着查。把 `delivery` 配成 `wait`（或调用时传
+`delivery: "wait"`）则改为在调用里轮询；等到时限还没结果就转到后台，结果仍以事件送达。
+
+- **接口地址**：异步接口用百炼的工作空间地址
+  `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com`；经典域名没有这条路径时，报错会提示换地址。
+- **上传凭证**：`GET https://dashscope.aliyuncs.com/api/v1/uploads?action=getPolicy&model=<模型>`
+  （新加坡地域用 `dashscope-intl.aliyuncs.com`）。上传与转写要用同一个阿里云主账号的 Key。
+- **结果**：结果 JSON 里的 `transcripts[].text` 按行拼接。
+- **控制台「试转写」**：异步协议不在页面里等结果；到对话里调用 `stt_transcribe`，结果以事件送达。
 
 ## 本地 STT：OpenAI 兼容接口（`protocol: "openai"`）
 

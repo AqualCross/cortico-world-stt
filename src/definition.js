@@ -8,8 +8,8 @@ import { STT_TOOL_DECLS, SttWorld } from './world.js';
 /** 自描述里每个工具配一句给人看的话，按工具名。 */
 const TOOL_SUMMARIES = {
   stt_transcribe: {
-    zh: '把一个音频文件（或 log:/mem: 句柄）转写成文字，记进转写记录并交回对话。',
-    en: 'Transcribe an audio file (or a log:/mem: handle) to text; the text is saved to the transcript list and returned to the conversation.',
+    zh: '把一个音频文件（或 log:/mem: 句柄）转写成文字，记进转写记录并交回对话；event 交付时立刻回执，结果稍后以事件送达。',
+    en: 'Transcribe an audio file (or a log:/mem: handle) to text; the text is saved to the transcript list and returned to the conversation. With event delivery the call returns at once and the text arrives later as an event.',
   },
 };
 
@@ -44,7 +44,24 @@ export const sttDefinition = {
   /** 自描述：可能出现的全部工具与事件，不进提示词。`describe:extension` 把它导出成 describe.json。 */
   describe: {
     tools: describeTools(STT_TOOL_DECLS),
-    events: [],
+    events: [
+      {
+        type: 'stt.transcript',
+        description: {
+          zh: '转写完成：正文是转写文字，meta 带任务号、模型与来源。',
+          en: 'Transcription finished: the text is the transcript; meta carries the task id, model and source.',
+        },
+        trigger: 'debounce',
+      },
+      {
+        type: 'stt.transcribe-failed',
+        description: {
+          zh: '转写失败或超时：正文是原因，meta 带任务号与来源。',
+          en: 'Transcription failed or timed out: the text is the reason; meta carries the task id and source.',
+        },
+        trigger: 'debounce',
+      },
+    ],
   },
 };
 

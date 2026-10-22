@@ -46,6 +46,15 @@ async function checkAsync(label, fn) {
   }
 }
 
+async function waitFor(fn, ms = 3000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (fn()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`等待超时：${ms}ms`);
+}
+
 /** 键序无关的 JSON 形态：对比 describe.json 与代码里的声明（与框架的深比较等价）。 */
 function stable(value) {
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
@@ -144,7 +153,7 @@ try {
     const defaults = def.defaults();
     eq(defaults.enabled, false, 'enabled 默认 false');
     eq(defaults.protocol, 'dashscope', 'protocol 默认');
-    eq(defaults.model, 'qwen-audio-3.1-asr-flash', 'model 默认');
+    eq(defaults.model, 'qwen3-asr-flash', 'model 默认');
     eq(defaults.maxMb, 7, 'maxMb 默认');
     def.preflight(); // 环境满足时不抛
   });
@@ -155,7 +164,8 @@ try {
     const file = JSON.parse(readFileSync(join(pkgDir, 'describe.json'), 'utf8'));
     eq(stable(file), stable(JSON.parse(JSON.stringify(def.describe))), 'describe.json 与代码里的 describe 不一致');
     eq(file.tools[0].name, 'stt_transcribe', 'describe 工具名');
-    eq(file.events.length, 0, '这个 World 不该声明事件');
+    eq(file.events.length, 2, '异步协议声明两个事件');
+    eq(file.events.map((e) => e.type).join(','), 'stt.transcript,stt.transcribe-failed', '事件类型');
     const names = new Set(file.tools.map((t) => t.name));
     for (const tool of makeWorld().tools()) assert(names.has(tool.name), `工具 ${tool.name} 不在 describe.tools 里`);
   });
@@ -371,6 +381,8 @@ try {
       { status: 404, json: { code: 'ModelNotFound', message: 'nope' }, want: '接口地址' },
       { status: 429, json: { code: 'Throttling', message: 'Requests rate limit exceeded' }, want: '限流' },
       { status: 400, json: { code: 'InvalidParameter', message: 'audio format not supported' }, want: '格式' },
+      { status: 400, json: { code: 'InvalidParameter', message: 'url error, please check url！ For details, see: https://help.aliyun.com/zh/model-studio/error-code#error-url' }, want: '地址' },
+      { status: 400, json: { code: 'InvalidParameter', message: 'Model not exist.' }, want: '模型' },
     ];
     for (const one of cases) {
       installFetch(() => jsonRes(one.json, one.status));
@@ -465,13 +477,126 @@ try {
     }
   });
 
+  await checkAsync('异步文件转写：取凭证 → 上传 → 提交 → 查询 → 下载结果', async () => {
+    const body = wav.sampleWav(0.2);
+    const seen = [];
+    installFetch((u, init) => {
+      seen.push({ u, init });
+      if (u === 'https://dashscope.test/api/v1/uploads?action=getPolicy&model=filetrans-x') {
+        return jsonRes({
+          data: {
+            policy: 'p',
+            signature: 's',
+            upload_host: 'https://upload.test',
+            upload_dir: 'dashscope-instant/abc',
+            oss_access_key_id: 'AK',
+            x_oss_object_acl: 'private',
+            x_oss_forbid_overwrite: 'true',
+          },
+        });
+      }
+      if (u === 'https://upload.test') return new Response('', { status: 200 });
+      if (u === 'https://dash.test/api/v1/services/audio/asr/transcription') {
+        return jsonRes({ output: { task_id: 't1', task_status: 'PENDING' }, request_id: 'r1' });
+      }
+      if (u === 'https://dash.test/api/v1/tasks/t1') {
+        return jsonRes({
+          output: {
+            task_id: 't1',
+            task_status: 'SUCCEEDED',
+            results: [{ subtask_status: 'SUCCEEDED', transcription_url: 'https://result.test/r.json' }],
+          },
+          usage: { duration: 3 },
+        });
+      }
+      if (u === 'https://result.test/r.json') {
+        return jsonRes({
+          properties: { original_duration_in_milliseconds: 3200 },
+          transcripts: [{ text: '你好。' }, { text: '第二段。' }],
+        });
+      }
+      throw new Error(`没料到的请求：${u}`);
+    });
+    try {
+      const up = await api.uploadToDashScope({
+        apiKey: 'sk-1',
+        model: 'filetrans-x',
+        bytes: body,
+        name: '语音 1.wav',
+        mime: 'audio/wav',
+        uploadBaseUrl: 'https://dashscope.test',
+      });
+      eq(up.fileUrl, 'oss://dashscope-instant/abc/语音_1.wav', '临时 URL');
+      const upload = seen.find((c) => c.u === 'https://upload.test');
+      assert(upload.init.body instanceof FormData, '上传应是 multipart');
+      eq(upload.init.body.get('key'), 'dashscope-instant/abc/语音_1.wav', 'key');
+      eq(upload.init.body.get('OSSAccessKeyId'), 'AK', 'AccessKeyId');
+      eq(upload.init.body.get('Signature'), 's', 'Signature');
+      assert(upload.init.body.get('file') instanceof Blob, 'file 应是 Blob');
+      const policy = seen.find((c) => c.u.includes('/api/v1/uploads'));
+      eq(policy.init.headers.Authorization, 'Bearer sk-1', '凭证接口的 Authorization');
+
+      const sub = await api.submitDashScopeAsync({
+        baseUrl: 'https://dash.test',
+        apiKey: 'sk-1',
+        model: 'filetrans-x',
+        fileUrl: up.fileUrl,
+        languageHints: ['zh', 'en'],
+      });
+      eq(sub.taskId, 't1', 'task_id');
+      const post = seen.find((c) => c.u.endsWith('/audio/asr/transcription'));
+      eq(post.init.headers['X-DashScope-Async'], 'enable', '异步头');
+      eq(post.init.headers['X-DashScope-OssResourceResolve'], 'enable', 'oss 解析头');
+      const sent = JSON.parse(post.init.body);
+      eq(sent.model, 'filetrans-x', 'model');
+      eq(JSON.stringify(sent.input.file_urls), '["oss://dashscope-instant/abc/语音_1.wav"]', 'file_urls');
+      eq(JSON.stringify(sent.parameters.channel_id), '[0]', 'channel_id');
+      eq(JSON.stringify(sent.parameters.language_hints), '["zh","en"]', 'language_hints');
+
+      const task = await api.queryDashScopeTask({ baseUrl: 'https://dash.test', apiKey: 'sk-1', taskId: 't1' });
+      eq(task.status, 'SUCCEEDED', '任务状态');
+      eq(task.usage.duration, 3, 'usage');
+      const res = await api.fetchDashScopeTranscript(task.transcriptionUrl);
+      eq(res.text, '你好。\n第二段。', '多段拼接');
+      eq(res.seconds, 3.2, '结果里的时长');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('异步提交 404：提示换成工作空间地址', async () => {
+    const body = wav.sampleWav(0.2);
+    installFetch((u) => {
+      if (u.includes('/api/v1/uploads')) {
+        return jsonRes({
+          data: {
+            policy: 'p', signature: 's', upload_host: 'https://upload.test',
+            upload_dir: 'd', oss_access_key_id: 'AK',
+          },
+        });
+      }
+      if (u === 'https://upload.test') return new Response('', { status: 200 });
+      return jsonRes({ message: 'not found' }, 404);
+    });
+    try {
+      const up = await api.uploadToDashScope({ apiKey: 'k', model: 'm', bytes: body, uploadBaseUrl: 'https://dashscope.test' });
+      await api.submitDashScopeAsync({ baseUrl: 'https://dash.test', apiKey: 'k', model: 'm', fileUrl: up.fileUrl });
+      throw new Error('404 应当抛错');
+    } catch (err) {
+      assert(err instanceof api.SttApiError, `不是 SttApiError：${err?.name}`);
+      assert(err.message.includes('工作空间'), `404 提示不对：${err?.message}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // -------------------------------------------------------------------------
   console.log('工具整条链');
 
   await checkAsync('转写 → 记录 → 回执（文件路径输入）', async () => {
     const body = wav.sampleWav(0.4);
     const botDir = makeWorkspace('bot-a', 'hello.wav', body);
-    const world = makeWorld({}, { dataDir: join(scratch, 'data-a'), botDir });
+    const world = makeWorld({ model: 'qwen-audio-3.1-asr-flash' }, { dataDir: join(scratch, 'data-a'), botDir });
     installFetch((u, init) => {
       if (u.endsWith(ASR_PATH)) {
         return jsonRes({
@@ -509,7 +634,7 @@ try {
 
   await checkAsync('句柄输入：走宿主 blob；解析不了要给出人话', async () => {
     const body = wav.sampleWav(0.3);
-    const world = makeWorld({}, { dataDir: join(scratch, 'data-b') });
+    const world = makeWorld({ model: 'qwen-audio-3.1-asr-flash' }, { dataDir: join(scratch, 'data-b') });
     const host = {
       blob: (h) => (h === 'mem:ok.wav' ? { bytes: new Uint8Array(body), mime: 'audio/wav' } : null),
       log: {},
@@ -581,6 +706,316 @@ try {
       assert(out.text.includes('文字：它说话了。'), '回执没有文字');
       const summary = await world.invoke('transcripts', 'list', [10]);
       eq(summary.items[0].protocol, 'openai', '协议没记上');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  console.log('异步协议');
+
+  function makeHost() {
+    const events = [];
+    const host = {
+      pushEvent: async (e) => {
+        events.push(e);
+        return { ...e, cursor: events.length };
+      },
+      blob: () => null,
+      log: { info() {}, warn() {} },
+    };
+    return { host, events };
+  }
+
+  function makeAsyncWorld(dataDir, botDir, overrides = {}) {
+    return new mod.SttWorld({
+      cfg: {
+        ...def.defaults(),
+        enabled: true,
+        protocol: 'dashscope-async',
+        model: 'qwen3-asr-flash-filetrans',
+        baseUrl: 'https://dash.test',
+        ...overrides,
+      },
+      dataDir,
+      botDir: botDir ?? join(scratch, 'bot-async'),
+      secret: () => 'sk-test',
+      storeSecret: () => {},
+      pollMs: 5,
+    });
+  }
+
+  const ASYNC_PATH = '/api/v1/services/audio/asr/transcription';
+
+  await checkAsync('提交即回执，轮询完成后发事件并记录', async () => {
+    const body = wav.sampleWav(0.4);
+    const botDir = makeWorkspace('bot-e', 'talk.wav', body);
+    const world = makeAsyncWorld(join(scratch, 'data-e'), botDir);
+    const { host, events } = makeHost();
+    installFetch((u) => {
+      if (u.startsWith('https://dashscope.aliyuncs.com/api/v1/uploads')) {
+        return jsonRes({
+          data: {
+            policy: 'p', signature: 's', upload_host: 'https://upload.test',
+            upload_dir: 'dir', oss_access_key_id: 'AK',
+          },
+        });
+      }
+      if (u === 'https://upload.test') return new Response('', { status: 200 });
+      if (u.endsWith(ASYNC_PATH)) return jsonRes({ output: { task_id: 't9' } });
+      if (u === 'https://dash.test/api/v1/tasks/t9') {
+        return jsonRes({
+          output: {
+            task_id: 't9',
+            task_status: 'SUCCEEDED',
+            results: [{ subtask_status: 'SUCCEEDED', transcription_url: 'https://result.test/t9.json' }],
+          },
+          usage: { duration: 0.4 },
+        });
+      }
+      if (u === 'https://result.test/t9.json') {
+        return jsonRes({
+          properties: { original_duration_in_milliseconds: 400 },
+          transcripts: [{ text: '异步结果。' }],
+        });
+      }
+      throw new Error(`没料到的请求：${u}`);
+    });
+    try {
+      await world.start(host);
+      const out = await world.tools()[0].handler({ audio: 'talk.wav', note: '演示' }, {});
+      assert(!out.failed, `不该失败：${out.text}`);
+      assert(out.text.includes('已提交') && out.text.includes('t9'), `回执不对：${out.text}`);
+      await waitFor(() => events.length > 0);
+      eq(events[0].type, 'stt.transcript', '事件类型');
+      assert(events[0].text.includes('异步结果。'), '事件正文没带文字');
+      eq(events[0].meta.taskId, 't9', 'meta.taskId');
+      const summary = await world.invoke('transcripts', 'list', [10]);
+      eq(summary.items[0].text, '异步结果。', '记录文本');
+      eq(summary.items[0].protocol, 'filetrans', '协议');
+      eq(summary.items[0].seconds, 0.4, '时长');
+      eq((await world.invoke('status', 'state')).pending, 0, '在途任务应清空');
+      eq(readFileSync(join(scratch, 'data-e', 'stt', 'pending.json'), 'utf8').includes('t9'), false, '任务号应落盘再清掉');
+      await world.stop();
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('重启后在途任务接着轮询', async () => {
+    const dataDir = join(scratch, 'data-f');
+    const dir = join(dataDir, 'stt');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'pending.json'), JSON.stringify({
+      version: 1,
+      tasks: [{
+        id: 'x1',
+        taskId: 't2',
+        model: 'qwen3-asr-flash-filetrans',
+        note: '旧的',
+        source: { kind: 'file', ref: 'old.wav' },
+        audio: { name: 'old.wav', bytes: 1000, mime: 'audio/wav', format: 'wav', seconds: 1 },
+        submittedAt: new Date(Date.now() - 60000).toISOString(),
+        deadlineAt: new Date(Date.now() + 600000).toISOString(),
+        baseUrl: 'https://dash.test',
+        languageHints: [],
+      }],
+    }));
+    const world = makeAsyncWorld(dataDir);
+    const { host, events } = makeHost();
+    installFetch((u) => {
+      if (u === 'https://dash.test/api/v1/tasks/t2') {
+        return jsonRes({
+          output: {
+            task_id: 't2',
+            task_status: 'SUCCEEDED',
+            results: [{ subtask_status: 'SUCCEEDED', transcription_url: 'https://result.test/t2.json' }],
+          },
+        });
+      }
+      if (u === 'https://result.test/t2.json') return jsonRes({ transcripts: [{ text: '接着来的结果。' }] });
+      throw new Error(`没料到的请求：${u}`);
+    });
+    try {
+      eq((await world.invoke('status', 'state')).pending, 1, '启动前应看到在途任务');
+      await world.start(host);
+      await waitFor(() => events.length > 0);
+      assert(events[0].text.includes('接着来的结果。'), '恢复后的事件不对');
+      eq((await world.invoke('status', 'state')).pending, 0, '在途任务应清空');
+      await world.stop();
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('任务失败：发失败事件并清掉在途任务', async () => {
+    const dataDir = join(scratch, 'data-g');
+    const dir = join(dataDir, 'stt');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'pending.json'), JSON.stringify({
+      version: 1,
+      tasks: [{
+        taskId: 't3',
+        model: 'qwen3-asr-flash-filetrans',
+        source: { kind: 'file', ref: 'bad.wav' },
+        submittedAt: new Date().toISOString(),
+        deadlineAt: new Date(Date.now() + 600000).toISOString(),
+        baseUrl: 'https://dash.test',
+      }],
+    }));
+    const world = makeAsyncWorld(dataDir);
+    const { host, events } = makeHost();
+    installFetch(() => jsonRes({
+      output: {
+        task_id: 't3',
+        task_status: 'FAILED',
+        results: [{ subtask_status: 'FAILED', code: 'InvalidFile', message: '坏文件' }],
+      },
+    }));
+    try {
+      await world.start(host);
+      await waitFor(() => events.length > 0);
+      eq(events[0].type, 'stt.transcribe-failed', '事件类型');
+      assert(events[0].text.includes('坏文件'), '事件正文没带原因');
+      const state = await world.invoke('status', 'state');
+      eq(state.pending, 0, '在途任务应清空');
+      assert(state.lastError.includes('坏文件'), 'status 里应该有最近错误');
+      await world.stop();
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('在途任务过期：不联查，直接发失败事件', async () => {
+    const dataDir = join(scratch, 'data-h');
+    const dir = join(dataDir, 'stt');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'pending.json'), JSON.stringify({
+      version: 1,
+      tasks: [{
+        taskId: 't4',
+        model: 'qwen3-asr-flash-filetrans',
+        source: { kind: 'file', ref: 'slow.wav' },
+        submittedAt: new Date(Date.now() - 200000).toISOString(),
+        deadlineAt: new Date(Date.now() - 1000).toISOString(),
+        baseUrl: 'https://dash.test',
+      }],
+    }));
+    const world = makeAsyncWorld(dataDir);
+    const { host, events } = makeHost();
+    installFetch(() => {
+      throw new Error('过期任务不该再联网');
+    });
+    try {
+      await world.start(host);
+      await waitFor(() => events.length > 0);
+      eq(events[0].type, 'stt.transcribe-failed', '事件类型');
+      assert(events[0].text.includes('timeoutMs'), '失败原因该提到期限');
+      eq((await world.invoke('status', 'state')).pending, 0, '在途任务应清空');
+      await world.stop();
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('同步协议 + 工具参数 event：立即回执，后台完成后发事件', async () => {
+    const body = wav.sampleWav(0.4);
+    const botDir = makeWorkspace('bot-i', 'say.wav', body);
+    const world = makeWorld({}, { dataDir: join(scratch, 'data-i'), botDir });
+    const { host, events } = makeHost();
+    installFetch((u) => {
+      if (u.endsWith(ASR_PATH)) {
+        return jsonRes({
+          output: { choices: [{ message: { content: [{ type: 'text', text: '后台文字。' }] } }] },
+        });
+      }
+      throw new Error(`没料到的请求：${u}`);
+    });
+    try {
+      await world.start(host);
+      const out = await world.tools()[0].handler({ audio: 'say.wav', delivery: 'event' }, {});
+      assert(!out.failed && out.text.includes('已提交'), `回执不对：${out.text}`);
+      await waitFor(() => events.length > 0);
+      eq(events[0].type, 'stt.transcript', '事件类型');
+      assert(events[0].text.includes('后台文字。'), '事件正文没带文字');
+      const summary = await world.invoke('transcripts', 'list', [10]);
+      eq(summary.items[0].text, '后台文字。', '记录文本');
+      eq((await world.invoke('status', 'state')).pending, 0, '在途任务应清空');
+      await world.stop();
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('异步协议 + wait：在调用里等到文字，不发事件', async () => {
+    const body = wav.sampleWav(0.4);
+    const botDir = makeWorkspace('bot-j', 'wait.wav', body);
+    const world = makeAsyncWorld(join(scratch, 'data-j'), botDir, { delivery: 'wait' });
+    const { host, events } = makeHost();
+    installFetch((u) => {
+      if (u.startsWith('https://dashscope.aliyuncs.com/api/v1/uploads')) {
+        return jsonRes({
+          data: {
+            policy: 'p', signature: 's', upload_host: 'https://upload.test',
+            upload_dir: 'dir', oss_access_key_id: 'AK',
+          },
+        });
+      }
+      if (u === 'https://upload.test') return new Response('', { status: 200 });
+      if (u.endsWith(ASYNC_PATH)) return jsonRes({ output: { task_id: 'tw' } });
+      if (u === 'https://dash.test/api/v1/tasks/tw') {
+        return jsonRes({
+          output: {
+            task_id: 'tw',
+            task_status: 'SUCCEEDED',
+            results: [{ subtask_status: 'SUCCEEDED', transcription_url: 'https://result.test/tw.json' }],
+          },
+        });
+      }
+      if (u === 'https://result.test/tw.json') return jsonRes({ transcripts: [{ text: '等待结果。' }] });
+      throw new Error(`没料到的请求：${u}`);
+    });
+    try {
+      await world.start(host);
+      const out = await world.tools()[0].handler({ audio: 'wait.wav' }, {});
+      assert(!out.failed, `不该失败：${out.text}`);
+      assert(out.text.includes('转写好了') && out.text.includes('等待结果。'), `回执不对：${out.text}`);
+      eq(events.length, 0, '阻塞式不该再发事件');
+      eq((await world.invoke('status', 'state')).pending, 0, '不该留下在途任务');
+      await world.stop();
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('重启时后台同步请求：发失败事件', async () => {
+    const dataDir = join(scratch, 'data-k');
+    const dir = join(dataDir, 'stt');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'pending.json'), JSON.stringify({
+      version: 1,
+      tasks: [{
+        id: 'r1',
+        kind: 'request',
+        model: 'qwen3-asr-flash',
+        source: { kind: 'file', ref: 'gone.wav' },
+        submittedAt: new Date(Date.now() - 60000).toISOString(),
+        deadlineAt: new Date(Date.now() + 600000).toISOString(),
+      }],
+    }));
+    const world = makeAsyncWorld(dataDir, undefined, { protocol: 'dashscope' });
+    const { host, events } = makeHost();
+    installFetch(() => {
+      throw new Error('重启后的请求不该再联网');
+    });
+    try {
+      eq((await world.invoke('status', 'state')).pending, 1, '启动前应看到在途请求');
+      await world.start(host);
+      await waitFor(() => events.length > 0);
+      eq(events[0].type, 'stt.transcribe-failed', '事件类型');
+      assert(events[0].text.includes('应用重启'), '失败原因不对');
+      eq((await world.invoke('status', 'state')).pending, 0, '在途请求应清空');
+      await world.stop();
     } finally {
       restoreFetch();
     }

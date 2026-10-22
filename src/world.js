@@ -7,23 +7,45 @@
  * 这里**不采集**任何声音：没有麦克风、没有实时流、没有语音切分——它是 agent 的
  * 一个批量工具（文件进、文字出）。只依赖框架契约与 Node 内置模块，服务端不需要编译。
  */
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, extname, isAbsolute, join, resolve } from 'node:path';
 
 import {
   MIME_BY_EXT,
   SttApiError,
+  fetchDashScopeTranscript,
   formatOf,
+  queryDashScopeTask,
   sniffAudio,
+  submitDashScopeAsync,
   transcribeByDashScope,
   transcribeByOpenAi,
+  uploadBaseFor,
+  uploadToDashScope,
 } from './api.js';
 import { DEFAULTS, ID, configGroup, text } from './config.js';
+import { PendingTasks } from './pending.js';
 import { Transcripts } from './transcripts.js';
 import { formatKb, formatSeconds, wavInfo } from './wav.js';
 
 const msg = (err) => (err instanceof Error ? err.message : String(err));
 const asText = (value) => (typeof value === 'string' ? value.trim() : '');
+/** 文件转写排队时间不可控，给结果的最短期限。 */
+const ASYNC_MIN_MS = 5 * 60_000;
+const noteLabel = (entry) => (entry.note ? `（${entry.note}）` : '');
+
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener?.('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener?.('abort', done, { once: true });
+  });
+}
 
 /** 全部工具的声明（不含 handler）；定义里的 describe 与 `tools()` 都取它。 */
 export const STT_TOOL_DECLS = [
@@ -31,14 +53,15 @@ export const STT_TOOL_DECLS = [
     name: 'stt_transcribe',
     tags: ['read'],
     interruptible: true,
-    description: 'Transcribe an audio file to text (batch, not realtime). The audio comes from a local file path or a log:/mem: handle; the text is saved to the transcript list.',
+    description: 'Transcribe an audio file to text (batch, not realtime). The audio comes from a local file path or a log:/mem: handle; the text is saved to the transcript list. By default the call waits for the text; with delivery=event it returns at once and the text arrives later as an event.',
     parameters: {
       type: 'object',
       properties: {
         audio: { type: 'string', description: 'Audio file path (absolute, or relative to the bot workspace) or a log:/mem: handle.' },
         note: { type: 'string', description: 'Short label for the transcript list.' },
+        delivery: { type: 'string', enum: ['wait', 'event'], description: 'wait = return the text in this call; event = return immediately and deliver the text as an event. Defaults to the configured delivery mode.' },
         language: { type: 'string', description: 'Language code such as zh / en; overrides the configured hints.' },
-        context: { type: 'string', description: 'Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope qwen-audio-3.x and openai only.)' },
+        context: { type: 'string', description: 'Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope sync qwen-audio-3.x and openai only.)' },
       },
       required: ['audio'],
     },
@@ -49,6 +72,10 @@ export class SttWorld {
   #host = null;
   #streams = new Set();
   #transcripts = null;
+  #pending = null;
+  #pollTimer = null;
+  #polling = false;
+  #pollMs = 5000;
   #busy = 0;
   #lastError = '';
   #lastItemAt = '';
@@ -61,6 +88,7 @@ export class SttWorld {
     this.secret = typeof opts.secret === 'function' ? opts.secret : () => '';
     this.storeSecret = typeof opts.storeSecret === 'function' ? opts.storeSecret : () => {};
     this.language = 'zh';
+    this.#pollMs = Number(opts.pollMs) > 0 ? Math.max(5, Number(opts.pollMs)) : 5000;
   }
 
   // -------------------------------------------------------------------------
@@ -101,9 +129,11 @@ export class SttWorld {
       .filter(Boolean);
   }
 
-  /** `worlds.stt.protocol`：dashscope = 百炼同步转写；openai = /v1/audio/transcriptions。 */
+  /** `worlds.stt.protocol`：dashscope = 同步；dashscope-async = 异步文件转写；openai = /v1/audio/transcriptions。 */
   #protocol() {
-    return this.#str('protocol') === 'openai' ? 'openai' : 'dashscope';
+    const value = this.#str('protocol');
+    if (value === 'openai') return 'openai';
+    return value === 'dashscope-async' ? 'dashscope-async' : 'dashscope';
   }
 
   /** 记录根目录：配置了就用配置的（相对路径按 bot 目录解析），否则 <dataDir>/stt。 */
@@ -166,6 +196,12 @@ export class SttWorld {
     return this.#transcripts;
   }
 
+  #pendingFor() {
+    const dir = this.dir();
+    if (!this.#pending || this.#pending.dir !== dir) this.#pending = new PendingTasks({ dir });
+    return this.#pending;
+  }
+
   #envState() {
     const t = this.#text();
     const protocol = this.#protocol();
@@ -176,8 +212,8 @@ export class SttWorld {
     const keySet = Boolean(key.value);
     const extra = { keyFrom: key.from, keyProvider: key.provider, model, protocol };
     if (!baseUrl) return { ok: false, baseUrl, model, name, keySet, detail: t.readyNoBase, ...extra };
-    // openai 兼容的本地服务通常不需要 key；dashscope 必需要有。
-    if (protocol === 'dashscope' && !keySet) {
+    // openai 兼容的本地服务通常不需要 key；百炼两种协议必需要有。
+    if (protocol !== 'openai' && !keySet) {
       return { ok: false, baseUrl, model, name, keySet, detail: t.readyNoKey, ...extra };
     }
     if (!model) return { ok: false, baseUrl, model, name, keySet, detail: t.readyNoModel, ...extra };
@@ -301,7 +337,7 @@ export class SttWorld {
     const protocol = this.#protocol();
     const keyName = this.#str('apiKeySecret');
     const key = this.apiKey();
-    if (protocol === 'dashscope' && !key) {
+    if (protocol !== 'openai' && !key) {
       return {
         text: `[stt_transcribe 没执行] 没有配置 ${keyName}：请在控制台「语音转文本 → 状态」里填入密钥（或在部署 .env 里写 ${keyName}=...）。`,
         failed: true,
@@ -319,61 +355,41 @@ export class SttWorld {
     const context = asText(args.context) || this.#str('context');
     const note = asText(args.note);
     const timeoutMs = this.#num('timeoutMs', 10000, 900000);
+    const delivery = this.#deliveryOf(args);
     this.#busy += 1;
     try {
-      const sampleRate = this.#num('sampleRate', 0, 48000) || audio.sampleRate || 0;
-      const res = protocol === 'openai'
-        ? await transcribeByOpenAi({
-            baseUrl: this.#str('baseUrl'),
-            apiKey: key,
-            model,
-            bytes: audio.bytes,
-            mime: audio.mime,
-            name: audio.fileName,
-            languageHints: hints,
-            context,
-            timeoutMs,
-            signal: ctx?.signal,
-          })
-        : await transcribeByDashScope({
-            baseUrl: this.#str('baseUrl'),
-            apiKey: key,
-            model,
-            bytes: audio.bytes,
-            mime: audio.mime,
-            format: audio.format,
-            sampleRate,
-            languageHints: hints,
-            context,
-            keepDialect: this.#bool('keepDialect'),
-            itn: this.#bool('itn'),
-            timeoutMs,
-            signal: ctx?.signal,
-          });
-      const seconds = res.seconds ?? audio.seconds;
-      const { item, warning } = this.#saveSafe({
-        text: res.text,
-        note,
-        source: { kind: audio.kind, ref: audio.ref },
+      if (protocol === 'dashscope-async') {
+        return delivery === 'wait'
+          ? await this.#asyncWait({ audio, model, key, hints, note, timeoutMs, signal: ctx?.signal })
+          : await this.#asyncEvent({ audio, model, key, hints, note, timeoutMs });
+      }
+      const call = () => this.#callSync({
+        protocol,
+        baseUrl: this.#str('baseUrl'),
+        key,
         model,
-        protocol: res.shape,
-        language: res.language ?? '',
-        seconds,
-        audioBytes: audio.bytes.length,
-        audioMime: audio.mime,
-        format: audio.format ?? '',
-        usage: res.usage,
-      });
-      return this.#outcome({
-        text: res.text,
-        note,
-        item,
-        warning,
         audio,
-        model,
-        language: res.language,
-        seconds,
+        hints,
+        context,
+        note,
+        timeoutMs,
       });
+      if (delivery === 'event') {
+        return this.#syncEvent({ audio, model, note, deadlineMs: Math.max(timeoutMs, ASYNC_MIN_MS) }, call);
+      }
+      const done = await this.#callSync({
+        protocol,
+        baseUrl: this.#str('baseUrl'),
+        key,
+        model,
+        audio,
+        hints,
+        context,
+        note,
+        timeoutMs,
+        signal: ctx?.signal,
+      });
+      return this.#outcomeFrom(done, { audio, model, note });
     } catch (err) {
       return this.#failure('stt_transcribe', err);
     } finally {
@@ -381,11 +397,397 @@ export class SttWorld {
     }
   }
 
+  /** 本次调用怎么交结果：工具参数 > 配置 > auto（同步等、异步发事件）。 */
+  #deliveryOf(args) {
+    const asked = asText(args?.delivery);
+    if (asked === 'wait' || asked === 'event') return asked;
+    const configured = this.#str('delivery');
+    if (configured === 'wait' || configured === 'event') return configured;
+    return this.#protocol() === 'dashscope-async' ? 'event' : 'wait';
+  }
+
+  /** 同步形态（dashscope / openai）一次请求，顺手落记录。 */
+  async #callSync({ protocol, baseUrl, key, model, audio, hints, context, note, timeoutMs, signal }) {
+    const sampleRate = this.#num('sampleRate', 0, 48000) || audio.sampleRate || 0;
+    const res = protocol === 'openai'
+      ? await transcribeByOpenAi({
+          baseUrl,
+          apiKey: key,
+          model,
+          bytes: audio.bytes,
+          mime: audio.mime,
+          name: audio.fileName,
+          languageHints: hints,
+          context,
+          timeoutMs,
+          signal,
+        })
+      : await transcribeByDashScope({
+          baseUrl,
+          apiKey: key,
+          model,
+          bytes: audio.bytes,
+          mime: audio.mime,
+          format: audio.format,
+          sampleRate,
+          languageHints: hints,
+          context,
+          keepDialect: this.#bool('keepDialect'),
+          itn: this.#bool('itn'),
+          timeoutMs,
+          signal,
+        });
+    const seconds = res.seconds ?? audio.seconds;
+    const { item, warning } = this.#saveSafe({
+      text: res.text,
+      note,
+      source: { kind: audio.kind, ref: audio.ref },
+      model,
+      protocol: res.shape,
+      language: res.language ?? '',
+      seconds,
+      audioBytes: audio.bytes.length,
+      audioMime: audio.mime,
+      format: audio.format ?? '',
+      usage: res.usage,
+    });
+    return { res, seconds, item, warning };
+  }
+
+  #outcomeFrom(done, { audio, model, note }) {
+    return this.#outcome({
+      text: done.res.text,
+      note,
+      item: done.item,
+      warning: done.warning,
+      audio,
+      model,
+      language: done.res.language,
+      seconds: done.seconds,
+    });
+  }
+
   #failure(tool, err) {
     const detail = err instanceof SttApiError ? err.message : msg(err);
     this.#lastError = `${new Date().toISOString()} ${detail}`;
     this.#emit({ t: 'error', message: detail, tool }, true);
     return { text: `[${tool} 失败] ${detail}`, failed: true };
+  }
+
+  // -------------------------------------------------------------------------
+  // 在途任务：异步任务靠任务号轮询，后台同步请求靠进程内 Promise
+  // -------------------------------------------------------------------------
+
+  /** 上传 → 提交，拿任务号走人。 */
+  async #submitTask({ audio, model, key, hints, timeoutMs, signal }) {
+    const baseUrl = this.#str('baseUrl');
+    const uploaded = await uploadToDashScope({
+      apiKey: key,
+      model,
+      bytes: audio.bytes,
+      name: audio.fileName,
+      mime: audio.mime,
+      uploadBaseUrl: uploadBaseFor(baseUrl),
+      timeoutMs,
+      signal,
+    });
+    const submitted = await submitDashScopeAsync({
+      baseUrl,
+      apiKey: key,
+      model,
+      fileUrl: uploaded.fileUrl,
+      languageHints: hints,
+      timeoutMs,
+      signal,
+    });
+    return submitted.taskId;
+  }
+
+  #newPending({ kind, taskId, model, note, audio, hints = [], deadlineMs }) {
+    const now = Date.now();
+    return this.#pendingFor().add({
+      id: randomBytes(4).toString('hex'),
+      kind,
+      taskId,
+      model,
+      note,
+      source: { kind: audio.kind, ref: audio.ref },
+      audio: {
+        name: audio.fileName,
+        bytes: audio.bytes.length,
+        mime: audio.mime,
+        format: audio.format,
+        seconds: audio.seconds,
+      },
+      submittedAt: new Date(now).toISOString(),
+      deadlineAt: new Date(now + deadlineMs).toISOString(),
+      baseUrl: this.#str('baseUrl'),
+      languageHints: hints,
+    });
+  }
+
+  /** 异步协议 + 事件式：提交后立即回执。 */
+  async #asyncEvent({ audio, model, key, hints, note, timeoutMs }) {
+    const taskId = await this.#submitTask({ audio, model, key, hints, timeoutMs });
+    const entry = this.#newPending({
+      kind: 'task',
+      taskId,
+      model,
+      note,
+      audio,
+      hints,
+      deadlineMs: Math.max(timeoutMs, ASYNC_MIN_MS),
+    });
+    this.#schedulePoll(0);
+    this.#emit({ t: 'pending', task: this.#taskView(entry) });
+    return {
+      text: [
+        `[stt_transcribe 已提交] 异步转写任务 ${taskId}（${model}）。`,
+        '排队可能要几分钟；完成后文字会作为事件送达，不用重复提交。',
+        `来源：${entry.source.ref}${note ? ` · 名字：${note}` : ''}`,
+      ].join('\n'),
+    };
+  }
+
+  /** 异步协议 + 阻塞：提交后在调用里轮询；等不及就交给后台，结果仍以事件送达。 */
+  async #asyncWait({ audio, model, key, hints, note, timeoutMs, signal }) {
+    const taskId = await this.#submitTask({ audio, model, key, hints, timeoutMs, signal });
+    const baseUrl = this.#str('baseUrl');
+    const deadlineMs = Math.max(timeoutMs, ASYNC_MIN_MS);
+    const deadline = Date.now() + deadlineMs;
+    let lastError = '';
+    while (Date.now() < deadline && !signal?.aborted) {
+      let task;
+      try {
+        task = await queryDashScopeTask({ baseUrl, apiKey: key, taskId, timeoutMs: 30000, signal });
+      } catch (err) {
+        if (signal?.aborted) break;
+        lastError = err instanceof SttApiError ? err.message : msg(err);
+        await sleep(Math.min(this.#pollMs, 5000), signal);
+        continue;
+      }
+      if (task.status === 'SUCCEEDED') {
+        if (task.subtaskStatus === 'FAILED' || !task.transcriptionUrl) {
+          throw new SttApiError(task.error || '任务结束了，但没有结果地址');
+        }
+        const res = await fetchDashScopeTranscript(task.transcriptionUrl, { timeoutMs: 60000, signal });
+        const seconds = res.seconds ?? audio.seconds;
+        const { item, warning } = this.#saveSafe({
+          text: res.text,
+          note,
+          source: { kind: audio.kind, ref: audio.ref },
+          model,
+          protocol: 'filetrans',
+          language: res.language ?? '',
+          seconds,
+          audioBytes: audio.bytes.length,
+          audioMime: audio.mime,
+          format: audio.format ?? '',
+          usage: task.usage,
+        });
+        return this.#outcome({
+          text: res.text,
+          note,
+          item,
+          warning,
+          audio,
+          model,
+          language: res.language,
+          seconds,
+        });
+      }
+      if (task.status === 'FAILED') throw new SttApiError(task.error || '任务失败（服务器没给原因）');
+      await sleep(Math.min(this.#pollMs, 5000), signal);
+    }
+    const entry = this.#newPending({
+      kind: 'task',
+      taskId,
+      model,
+      note,
+      audio,
+      hints,
+      deadlineMs: ASYNC_MIN_MS,
+    });
+    this.#schedulePoll(0);
+    this.#emit({ t: 'pending', task: this.#taskView(entry) });
+    return {
+      text: [
+        `[stt_transcribe 还在排队] 任务 ${taskId}（${model}）没在 ${Math.round(deadlineMs / 1000)} 秒内出结果；已转到后台，完成后文字会作为事件送达。`,
+        lastError ? `最近一次查询失败：${lastError}` : '',
+        `来源：${audio.ref}${note ? ` · 名字：${note}` : ''}`,
+      ].filter(Boolean).join('\n'),
+    };
+  }
+
+  /** 同步协议 + 事件式：请求在后台跑，完成发事件。 */
+  #syncEvent({ audio, model, note, deadlineMs }, call) {
+    const entry = this.#newPending({ kind: 'request', model, note, audio, deadlineMs });
+    this.#emit({ t: 'pending', task: this.#taskView(entry) });
+    void this.#runSyncJob(entry, call);
+    return {
+      text: [
+        `[stt_transcribe 已提交] 后台转写（${model}）。`,
+        '完成后文字会作为事件送达。',
+        `来源：${audio.ref}${note ? ` · 名字：${note}` : ''}`,
+      ].join('\n'),
+    };
+  }
+
+  async #runSyncJob(entry, call) {
+    try {
+      const done = await call();
+      this.#pendingFor().remove(entry.id);
+      this.#emit({ t: 'settled', task: this.#taskView(entry), ok: true, item: done.item });
+      this.#emitTranscriptEvent(entry, 'stt.transcript', `转写完成${noteLabel(entry)}：\n${done.res.text}`, {
+        seconds: done.seconds,
+        itemId: done.item?.id ?? '',
+      });
+    } catch (err) {
+      this.#finishFailed(entry, err instanceof SttApiError ? err.message : msg(err));
+    }
+  }
+
+  #taskView(entry) {
+    return {
+      id: entry.id,
+      kind: entry.kind,
+      taskId: entry.taskId || '',
+      model: entry.model,
+      note: entry.note,
+      source: entry.source,
+      submittedAt: entry.submittedAt,
+      deadlineAt: entry.deadlineAt,
+    };
+  }
+
+  #schedulePoll(delay = this.#pollMs) {
+    if (this.#pollTimer || !this.#host) return;
+    this.#pollTimer = setTimeout(() => {
+      this.#pollTimer = null;
+      this.#pollOnce().catch((err) => {
+        this.#host?.log?.warn?.('语音转文本：轮询在途任务失败', { detail: msg(err) });
+        if (this.#pendingFor().count) this.#schedulePoll();
+      });
+    }, Math.max(0, delay));
+    this.#pollTimer.unref?.();
+  }
+
+  async #pollOnce() {
+    if (this.#polling) return;
+    const tasks = this.#pendingFor().list();
+    if (!tasks.length) return;
+    this.#polling = true;
+    try {
+      for (const entry of tasks) {
+        try {
+          await this.#checkTask(entry);
+        } catch (err) {
+          this.#host?.log?.warn?.('语音转文本：查询异步任务失败', {
+            taskId: entry.taskId,
+            detail: msg(err),
+          });
+        }
+      }
+    } finally {
+      this.#polling = false;
+    }
+    if (this.#pendingFor().count) this.#schedulePoll();
+  }
+
+  async #checkTask(entry) {
+    if (entry.kind === 'request') return; // 进程内的请求自己收尾；重启时在 start 里标失败。
+    const deadline = Date.parse(entry.deadlineAt) || 0;
+    if (deadline && Date.now() >= deadline) {
+      const waited = Math.round((Date.now() - (Date.parse(entry.submittedAt) || Date.now())) / 1000);
+      this.#finishFailed(entry, `等了 ${waited} 秒还没出结果（worlds.stt.timeoutMs）`);
+      return;
+    }
+    const key = this.apiKey();
+    if (!key) return; // 密钥被清掉时先留着，等配置恢复或期限到。
+    const task = await queryDashScopeTask({
+      baseUrl: entry.baseUrl || this.#str('baseUrl'),
+      apiKey: key,
+      taskId: entry.taskId,
+      timeoutMs: 30000,
+    });
+    if (task.status === 'SUCCEEDED') {
+      if (task.subtaskStatus === 'FAILED' || !task.transcriptionUrl) {
+        this.#finishFailed(entry, task.error || '任务结束了，但没有结果地址');
+        return;
+      }
+      const res = await fetchDashScopeTranscript(task.transcriptionUrl, { timeoutMs: 60000 });
+      this.#finishSucceeded(entry, res, task);
+      return;
+    }
+    if (task.status === 'FAILED') {
+      this.#finishFailed(entry, task.error || '任务失败（服务器没给原因）');
+    }
+  }
+
+  #finishSucceeded(entry, res, task) {
+    this.#pendingFor().remove(entry.id);
+    const seconds = res.seconds ?? entry.audio?.seconds ?? null;
+    const { item, warning } = this.#saveSafe({
+      text: res.text,
+      note: entry.note,
+      source: entry.source,
+      model: entry.model,
+      protocol: 'filetrans',
+      language: res.language ?? '',
+      seconds,
+      audioBytes: entry.audio?.bytes ?? 0,
+      audioMime: entry.audio?.mime ?? '',
+      format: entry.audio?.format ?? '',
+      usage: task?.usage ?? null,
+    });
+    if (warning) this.#host?.log?.warn?.('语音转文本：记录没存上', { detail: warning });
+    this.#emit({ t: 'settled', task: this.#taskView(entry), ok: true, item });
+    this.#emitTranscriptEvent(
+      entry,
+      'stt.transcript',
+      `转写完成${noteLabel(entry)}：\n${res.text}`,
+      { seconds, itemId: item?.id ?? '' },
+    );
+  }
+
+  #finishFailed(entry, detail) {
+    this.#pendingFor().remove(entry.id);
+    this.#lastError = `${new Date().toISOString()} 转写失败：${detail}`;
+    this.#emit({ t: 'settled', task: this.#taskView(entry), ok: false, message: detail }, true);
+    this.#emitTranscriptEvent(
+      entry,
+      'stt.transcribe-failed',
+      `转写失败${noteLabel(entry)}：${detail}`,
+    );
+  }
+
+  #emitTranscriptEvent(entry, type, body, meta = {}) {
+    const host = this.#host;
+    if (!host?.pushEvent) return;
+    try {
+      const sent = host.pushEvent({
+        type,
+        source: this.id,
+        senderKey: entry.taskId || entry.id,
+        ts: new Date().toISOString(),
+        text: body,
+        meta: {
+          id: entry.id,
+          taskId: entry.taskId || '',
+          model: entry.model,
+          note: entry.note,
+          source: entry.source,
+          seconds: meta.seconds ?? null,
+          itemId: meta.itemId ?? '',
+        },
+      }, { trigger: 'debounce' });
+      sent?.catch?.((err) => host.log?.warn?.('语音转文本：事件没送出去', {
+        taskId: entry.taskId,
+        detail: msg(err),
+      }));
+    } catch (err) {
+      host.log?.warn?.('语音转文本：事件没送出去', { taskId: entry.taskId, detail: msg(err) });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -502,6 +904,7 @@ export class SttWorld {
       count: transcripts.count,
       totalAudioBytes: transcripts.totalAudioBytes,
       busy: this.#busy > 0,
+      pending: this.#pendingFor().count,
       lastError: this.#lastError,
       lastItemAt: this.#lastItemAt,
       protocol: this.#protocol(),
@@ -575,6 +978,9 @@ export class SttWorld {
       throw new Error(msg(err));
     }
     const protocol = this.#protocol();
+    if (protocol === 'dashscope-async') {
+      throw new Error('异步协议要上传后排队，不在「试转写」里等待：到对话里对这段音频调用 stt_transcribe，完成后结果会以事件送达。');
+    }
     const key = this.apiKey();
     if (protocol === 'dashscope' && !key) throw new Error(`没有配置 ${this.#str('apiKeySecret')}：先在这个页面填入密钥。`);
     const model = this.#str('model');
@@ -667,18 +1073,28 @@ export class SttWorld {
     this.#host = host;
     try {
       this.#transcriptsFor().ensure();
+      this.#pendingFor().ensure();
     } catch (err) {
       this.#host?.log?.warn?.('语音转文本：数据目录建不出来', { err: msg(err) });
     }
+    const restartLost = this.#pendingFor().list().filter((entry) => entry.kind === 'request');
+    for (const entry of restartLost) this.#finishFailed(entry, '应用重启，这次转写没完成');
+    const pending = this.#pendingFor().count;
     this.#host?.log?.info?.('语音转文本已就绪', {
       dir: this.dir(),
       model: this.#str('model'),
       protocol: this.#protocol(),
       key: this.apiKey() ? '已配置' : '未配置',
+      pending,
     });
+    if (pending) this.#schedulePoll();
   }
 
   async stop() {
+    if (this.#pollTimer) {
+      clearTimeout(this.#pollTimer);
+      this.#pollTimer = null;
+    }
     this.#streams.clear();
     this.#host = null;
   }

@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "stt_transcribe",
-      "description": "Transcribe an audio file to text (batch, not realtime). The audio comes from a local file path or a log:/mem: handle; the text is saved to the transcript list.",
+      "description": "Transcribe an audio file to text (batch, not realtime). The audio comes from a local file path or a log:/mem: handle; the text is saved to the transcript list. By default the call waits for the text; with delivery=event it returns at once and the text arrives later as an event.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -20,7 +20,15 @@
           },
           "context": {
             "type": "string",
-            "description": "Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope qwen-audio-3.x and openai only.)"
+            "description": "Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope sync qwen-audio-3.x and openai only.)"
+          },
+          "delivery": {
+            "type": "string",
+            "enum": [
+              "wait",
+              "event"
+            ],
+            "description": "wait = return the text in this call; event = return immediately and deliver the text as an event. Defaults to the configured delivery mode."
           }
         },
         "required": [
@@ -31,10 +39,27 @@
         "read"
       ],
       "summary": {
-        "zh": "把一个音频文件（或 log:/mem: 句柄）转写成文字，记进转写记录并交回对话。",
-        "en": "Transcribe an audio file (or a log:/mem: handle) to text; the text is saved to the transcript list and returned to the conversation."
+        "zh": "把一个音频文件（或 log:/mem: 句柄）转写成文字，记进转写记录并交回对话；event 交付时立刻回执，结果稍后以事件送达。",
+        "en": "Transcribe an audio file (or a log:/mem: handle) to text; the text is saved to the transcript list and returned to the conversation. With event delivery the call returns at once and the text arrives later as an event."
       }
     }
   ],
-  "events": []
+  "events": [
+    {
+      "type": "stt.transcript",
+      "description": {
+        "zh": "转写完成：正文是转写文字，meta 带任务号、模型与来源。",
+        "en": "Transcription finished: the text is the transcript; meta carries the task id, model and source."
+      },
+      "trigger": "debounce"
+    },
+    {
+      "type": "stt.transcribe-failed",
+      "description": {
+        "zh": "转写失败或超时：正文是原因，meta 带任务号与来源。",
+        "en": "Transcription failed or timed out: the text is the reason; meta carries the task id and source."
+      },
+      "trigger": "debounce"
+    }
+  ]
 }
