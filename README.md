@@ -56,8 +56,7 @@ pnpm add "D:\path\to\cortico-world-stt" --ignore-workspace
 把 `data/extensions/node_modules/cortico-world-stt` 做成指向本目录的目录联接，
 并自己在 `extensions/package.json` 里加 `"cortico-world-stt": "link:D:\\path\\to\\cortico-world-stt"`。
 
-**装完必须重启 Coopanion**：扩展是 ESM 模块，进程内不会重新加载。重启后在
-`config.json` 的 `worlds.stt.enabled` 上打开（控制台里也有这个开关），`stt_transcribe` 才会挂给桌宠。
+**装完必须重启 Coopanion**：扩展是 ESM 模块，进程内不会重新加载。重启后在 World 页启用本 World（写 `config.json` 的 `worlds.stt.enabled = true`），`stt_transcribe` 才会挂给桌宠。
 
 ### 一份能用的 `worlds.stt` 长什么样
 

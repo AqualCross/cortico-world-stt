@@ -8,7 +8,7 @@
 export const ID = 'stt';
 export const LABEL = '语音转文本';
 
-/** `worlds.stt` 段的默认值；键名与 configGroup 里的路径一一对应。 */
+/** `worlds.stt` 段的默认值；`enabled` 由框架的 World 开关管理，其余键与 configGroup 里的路径一一对应。 */
 export const DEFAULTS = Object.freeze({
   enabled: false,
   protocol: 'dashscope',
@@ -55,8 +55,6 @@ const ZH = {
   readyNoModel: '未选模型',
   config: {
     title: '语音转文本',
-    enabled: '启用语音转文本',
-    enabledDesc: '开启后桌宠才拿到 stt_transcribe 工具（把音频文件转成文字）。',
     protocol: '接口协议',
     protocolDesc: '接口形状：dashscope 同步转写；dashscope-async 异步文件转写（先上传，完成后发事件，模型名带 -filetrans）；openai 兼容 /v1/audio/transcriptions。',
     delivery: '交付方式',
@@ -108,8 +106,6 @@ const EN = {
   readyNoModel: 'no model selected',
   config: {
     title: 'Speech to Text',
-    enabled: 'Enable Speech to Text',
-    enabledDesc: 'Turns on the stt_transcribe tool for the bot (audio file to text).',
     protocol: 'Protocol',
     protocolDesc: 'Request shape: dashscope sync; dashscope-async file transcription (upload first, result arrives as an event; model name ends with -filetrans); openai-compatible /v1/audio/transcriptions.',
     delivery: 'Delivery',
@@ -147,7 +143,7 @@ export function text(language = 'zh') {
   return language === 'en' ? EN : ZH;
 }
 
-/** WebUI 的配置组；路径必须落在 `worlds.stt.` 段内，且每个键都在 DEFAULTS 里有对应项。 */
+/** WebUI 的配置组；路径必须落在 `worlds.stt.` 段内，且每个键都在 DEFAULTS 里有对应项（`enabled` 除外，它由框架的 World 开关渲染）。 */
 export function configGroup(language = 'zh') {
   const t = text(language).config;
   const K = `worlds.${ID}`;
@@ -158,7 +154,6 @@ export function configGroup(language = 'zh') {
       type: 'object',
       title: t.title,
       properties: {
-        [`${K}.enabled`]: { type: 'boolean', title: t.enabled, description: t.enabledDesc, 'x-hot': true },
         [`${K}.protocol`]: {
           type: 'string',
           title: t.protocol,
