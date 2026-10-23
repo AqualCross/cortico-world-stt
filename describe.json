@@ -14,14 +14,6 @@
             "type": "string",
             "description": "Short label for the transcript list."
           },
-          "language": {
-            "type": "string",
-            "description": "Language code such as zh / en; overrides the configured hints."
-          },
-          "context": {
-            "type": "string",
-            "description": "Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope sync qwen-audio-3.x and openai only.)"
-          },
           "delivery": {
             "type": "string",
             "enum": [
@@ -29,6 +21,14 @@
               "event"
             ],
             "description": "wait = return the text in this call; event = return immediately and deliver the text as an event. Defaults to the configured delivery mode."
+          },
+          "language": {
+            "type": "string",
+            "description": "Language code such as zh / en; overrides the configured hints."
+          },
+          "context": {
+            "type": "string",
+            "description": "Exact words (names, terms) likely spoken in the audio, in their original form; the engine matches against this text, so descriptions alone help little. Overrides the configured hint. (dashscope sync qwen-audio-3.x and openai only.)"
           }
         },
         "required": [
@@ -42,14 +42,55 @@
         "zh": "把一个音频文件（或 log:/mem: 句柄）转写成文字，记进转写记录并交回对话；event 交付时立刻回执，结果稍后以事件送达。",
         "en": "Transcribe an audio file (or a log:/mem: handle) to text; the text is saved to the transcript list and returned to the conversation. With event delivery the call returns at once and the text arrives later as an event."
       }
+    },
+    {
+      "name": "stt_watch",
+      "description": "Turn automatic transcription of event audio on or off, change what is watched, or read the state. start watches the configured event types (listen.chunk by default) and sends new events carrying an audio attachment to transcription; stop ends watching; set changes the watched event types or where transcript events go (archive = stored only, model = delivered to the conversation and wakes you); status shows the settings. Every change is saved to the config.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "start",
+              "stop",
+              "set",
+              "status"
+            ],
+            "description": "start = watch new events and transcribe their audio; stop = end watching; set = change what is watched or where events go; status = show the settings."
+          },
+          "events": {
+            "type": "string",
+            "description": "For start and set: comma-separated event types to watch, e.g. listen.chunk. For start it defaults to the configured list."
+          },
+          "eventDelivery": {
+            "type": "string",
+            "enum": [
+              "archive",
+              "model"
+            ],
+            "description": "For set: archive = transcript events are stored only; model = they are delivered to the conversation and wake you."
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "tags": [
+        "act"
+      ],
+      "summary": {
+        "zh": "打开或关闭「自动转写事件音频」，更换监听的事件类型或转写事件的去处，或查看当前状态。",
+        "en": "Turn automatic transcription of event audio on or off, change the watched event types or where transcript events go, or read the current state."
+      }
     }
   ],
   "events": [
     {
       "type": "stt.transcript",
       "description": {
-        "zh": "转写完成：正文是转写文字，meta 带任务号、模型与来源。",
-        "en": "Transcription finished: the text is the transcript; meta carries the task id, model and source."
+        "zh": "转写完成：正文是转写文字，meta 带任务号、模型与来源；去处由 worlds.stt.eventDelivery 决定（监听到的音频也走这里）。",
+        "en": "Transcription finished: the text is the transcript; meta carries the task id, model and source. Where it goes is set by worlds.stt.eventDelivery (watched audio lands the same way)."
       },
       "trigger": "debounce"
     },

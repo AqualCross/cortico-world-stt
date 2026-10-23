@@ -13,6 +13,9 @@ export const DEFAULTS = Object.freeze({
   enabled: false,
   protocol: 'dashscope',
   delivery: 'auto',
+  eventDelivery: 'model',
+  autoTranscribe: false,
+  watchEvents: 'listen.chunk',
   baseUrl: 'https://dashscope.aliyuncs.com',
   apiKeySecret: 'AUDIO_API_KEY',
   model: 'qwen3-asr-flash',
@@ -36,6 +39,18 @@ export const PROTOCOLS = Object.freeze(['dashscope', 'dashscope-async', 'openai'
 
 /** 结果怎么交回：auto = 同步等结果、异步发事件；wait = 总是等；event = 总是发事件。 */
 export const DELIVERIES = Object.freeze(['auto', 'wait', 'event']);
+/** 转写事件的去处：model = 投递到模型事件流；archive = 只落事件库。 */
+export const EVENT_DELIVERIES = Object.freeze(['archive', 'model']);
+/** 默认监听的事件类型（听觉切出的语音块）。 */
+export const DEFAULT_WATCH_EVENTS = 'listen.chunk';
+
+/** `watchEvents` 的写法：逗号或空白分隔的事件类型。 */
+export function watchTypes(value) {
+  return [...new Set(String(value ?? DEFAULT_WATCH_EVENTS)
+    .split(/[,，\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean))];
+}
 
 const ZH = {
   label: '语音转文本',
@@ -59,6 +74,12 @@ const ZH = {
     protocolDesc: '接口形状：dashscope 同步转写；dashscope-async 异步文件转写（先上传，完成后发事件，模型名带 -filetrans）；openai 兼容 /v1/audio/transcriptions。',
     delivery: '交付方式',
     deliveryDesc: 'wait = 工具调用里等结果再回；event = 立刻回执，完成后作为事件送达；auto = 同步转写等结果、异步文件转写发事件。',
+    eventDelivery: '事件去向',
+    eventDeliveryDesc: 'model = 转写事件投递到对话事件流（桌宠会被唤醒）；archive = 只落事件库，不唤醒。自动转写与 event 交付都走这里。',
+    autoTranscribe: '自动转写事件音频',
+    autoTranscribeDesc: '监听事件库里的指定事件，把带音频附件的新事件送去转写；结果按「事件去向」交付。只处理打开之后的事件，重启不补。',
+    watchEvents: '监听事件类型',
+    watchEventsDesc: `逗号分隔的事件类型；默认 ${DEFAULT_WATCH_EVENTS}（听觉切出的语音块）。只挑带音频附件的事件。`,
     baseUrl: '接口地址',
     baseUrlDesc: '接口的根地址。',
     keyName: '密钥变量名',
@@ -110,6 +131,12 @@ const EN = {
     protocolDesc: 'Request shape: dashscope sync; dashscope-async file transcription (upload first, result arrives as an event; model name ends with -filetrans); openai-compatible /v1/audio/transcriptions.',
     delivery: 'Delivery',
     deliveryDesc: 'wait = block the tool call until the text is ready; event = return at once and deliver the text as an event; auto = wait for sync transcription, events for async file transcription.',
+    eventDelivery: 'Event destination',
+    eventDeliveryDesc: 'model = deliver transcript events to the conversation (waking the pet); archive = store them without waking. Both auto-transcribe and event delivery use this.',
+    autoTranscribe: 'Transcribe event audio',
+    autoTranscribeDesc: 'Watch the configured event types and send new events carrying an audio attachment to transcription; the text is routed by Event destination. Only events after this is enabled, nothing is replayed on restart.',
+    watchEvents: 'Event types',
+    watchEventsDesc: `Comma-separated event types; the default is ${DEFAULT_WATCH_EVENTS} (the Hearing world's speech chunks). Only events with an audio attachment are picked up.`,
     baseUrl: 'Endpoint',
     baseUrlDesc: 'Root URL of the API.',
     keyName: 'Secret name',
@@ -168,6 +195,13 @@ export function configGroup(language = 'zh') {
           enum: [...DELIVERIES],
           'x-hot': true,
         },
+        [`${K}.eventDelivery`]: {
+          type: 'string',
+          title: t.eventDelivery,
+          description: t.eventDeliveryDesc,
+          enum: [...EVENT_DELIVERIES],
+          'x-hot': true,
+        },
         [`${K}.baseUrl`]: { type: 'string', title: t.baseUrl, description: t.baseUrlDesc, 'x-hot': true },
         [`${K}.apiKeySecret`]: { type: 'string', title: t.keyName, description: t.keyNameDesc },
         [`${K}.model`]: { type: 'string', title: t.model, description: t.modelDesc, 'x-hot': true },
@@ -219,6 +253,8 @@ export function configGroup(language = 'zh') {
           'x-suffix': ' 条',
         },
         [`${K}.pushToConsole`]: { type: 'boolean', title: t.push, description: t.pushDesc, 'x-hot': true },
+        [`${K}.autoTranscribe`]: { type: 'boolean', title: t.autoTranscribe, description: t.autoTranscribeDesc, 'x-hot': true },
+        [`${K}.watchEvents`]: { type: 'string', title: t.watchEvents, description: t.watchEventsDesc, 'x-hot': true },
       },
     },
   };

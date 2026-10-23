@@ -1,13 +1,13 @@
 # 语音转文本 · cortico-world-stt
 
-给 Coopanion 桌宠加一件事：**把音频文件转写成文字**。支持两种接口形状（阿里云百炼 Qwen-ASR 同步转写，与 OpenAI 兼容的 `/v1/audio/transcriptions`，后者可以接本地 whisper 服务），文字记进可浏览的转写记录，全文随工具回执交回对话。
+给 Coopanion 桌宠加一件事：**把音频文件转写成文字**。支持两种接口形状（阿里云百炼 Qwen-ASR 同步转写，与 OpenAI 兼容的 `/v1/audio/transcriptions`，后者可以接本地 whisper 服务），文字记进可浏览的转写记录，全文随工具回执交回对话。也可以先回执、完成后以事件送达；打开自动转写后，它还会监听事件库里带音频的事件（默认 `listen.chunk`）并逐块转写。
 
 这是一个 `cortico` 的 **World 扩展**（`kind: world`，`api: 6`），只补一个 `stt` 世界，
 不依赖任何第三方 npm 包（纯 ESM JS + Node 内置模块）。
 
-> **它不采集声音、不做实时监听、不做语音切分、不做流式。** 没有麦克风，没有常驻进程：
+> **它不采集声音、不做语音切分、不做流式。** 没有麦克风，没有常驻采集进程：
 > 它就是 agent 工具箱里的一件小事——递进来一个音频文件（或 `log:` / `mem:` 句柄），拿回一段文字。
-> 「听」和「说」是别的工具的事（渠道世界转来语音条、TTS 世界负责出声）。
+> 自动转写也只是读别的事件里已经切好的音频附件，切分归听觉，出声归播放工具。
 > 名字叫「语音转文本」而不是「实时语音识别」，就是在强调这一点。
 >
 > MIT 许可，见 [LICENSE](LICENSE)。非官方扩展：与 Coopanion / cortico 的作者无关。
@@ -19,6 +19,7 @@
 | 工具 | 标签 | 作用 |
 | --- | --- | --- |
 | `stt_transcribe` | `read` | 把一段音频（本地文件，或 `log:` / `mem:` 句柄）转写成文字，记进转写列表，并把全文放回回执 |
+| `stt_watch` | `act` | 打开/关闭「自动转写事件音频」、更换监听的事件类型或事件去处，或查看状态 |
 
 音频有两条来路：
 
@@ -90,6 +91,7 @@ pnpm add "D:\path\to\cortico-world-stt" --ignore-workspace
 | `enabled` | `false` | 是否把 `stt_transcribe` 挂给桌宠 |
 | `protocol` | `dashscope` | `dashscope` = 百炼 Qwen-ASR 同步转写；`dashscope-async` = 百炼异步文件转写（模型名带 `-filetrans`，提交后由后台轮询发事件）；`openai` = OpenAI 兼容的 `/v1/audio/transcriptions`（本地 whisper.cpp 这类） |
 | `delivery` | `auto` | 结果怎么交回：`wait` = 工具调用里等结果；`event` = 立刻回执，完成后作为事件送达；`auto` = 同步转写等结果、异步文件转写发事件。工具参数 `delivery` 可按次覆盖。 |
+| `eventDelivery` | `model` | 转写事件的去处：`model` = 投递到对话事件流（桌宠会被唤醒）；`archive` = 只落事件库，不唤醒。`event` 交付与自动转写共用这一个去处。 |
 | `baseUrl` | `https://dashscope.aliyuncs.com` | 接口根地址；同步路径是 `/api/v1/services/aigc/multimodal-generation/generation`，异步路径是 `/api/v1/services/audio/asr/transcription`（异步通常要换成工作空间地址，见下文） |
 | `apiKeySecret` | `AUDIO_API_KEY` | 密钥的**变量名**：先看部署 `.env`，再退到 `<bot 目录>/../providers/<端点>/.env` |
 | `model` | `qwen3-asr-flash` | 模型名；`qwen3-asr-*` 与 `qwen-audio-3.x-asr-*` / `fun-asr-*` 请求体不同，插件按名字自动选；带 `-filetrans` 的要配 `dashscope-async` |
@@ -103,6 +105,8 @@ pnpm add "D:\path\to\cortico-world-stt" --ignore-workspace
 | `saveDir` | 空 | 留空 = 本插件数据目录下的 `stt/` |
 | `keep` | `200` | 超出后自动删最旧的记录（只删记录，不碰源文件），`0` = 不清理 |
 | `pushToConsole` | `true` | 转写完实时推给「转写」页 |
+| `autoTranscribe` | `false` | 监听事件库里的指定事件，把带音频附件的新事件送去转写；只处理打开之后的事件 |
+| `watchEvents` | `listen.chunk` | 要监听的事件类型，逗号分隔；默认是听觉切出的语音块 |
 
 ### 交付方式
 
@@ -115,6 +119,17 @@ pnpm add "D:\path\to\cortico-world-stt" --ignore-workspace
 
 `auto` 按协议取上表的默认。工具参数 `delivery` 可以按次覆盖配置；模型自己知道音频多长，让它选就行。
 `event` 下进程重启：异步任务凭任务号接着查；同步请求没法续，启动时发一条 `stt.transcribe-failed`。
+
+### 监听事件音频
+
+`autoTranscribe: true` 后，本扩展每秒扫一次事件库，把 `watchEvents` 里列出的、带音频附件的新事件排队送去转写；结果按现有通路记进「转写」页，事件去处由 `eventDelivery` 决定。
+
+- 音频引用依次取：事件的音频附件句柄 → `meta.handle` → `meta.path`；句柄由 Core 解析，不复制源音频。
+- 只处理打开之后的事件：启动、`stt_watch start` 或改监听列表时游标都推到最新，不补转旧的。
+- 一块音频一个任务，按到的顺序排队；解析不出的句柄、超限或认不出的格式只跳过这一块。接口报错（401、超时等）后 10 秒内不再试下一块，并照旧发一条 `stt.transcribe-failed`。
+- 转写记录的名字会带上来源，例如「监听 listen.chunk」，看得见是哪一类事件转来的。
+- 桌宠用 `stt_watch` 控制：`start` / `stop` / `set`（换监听类型或事件去处）/ `status`，改动写进配置。
+- 和听觉搭配时把 `eventDelivery` 配成 `archive`：转写结果进记录、不进对话，就不会每听到一句都把桌宠叫醒一次。
 
 ### context 怎么写才有效
 
@@ -304,11 +319,14 @@ cortico-world-stt/
 - 想让它「听懂」QQ 语音条：渠道世界转来的语音在对话里以附件（`log:` 句柄）出现，
   让它把这个句柄交给 `stt_transcribe` 就行。
 - 专有名词老识别错时，把词表填进 `context`（例如「本鲸、Coopanion、阿里云」），qwen-audio 族会带上下文。
+- 想让它跟着听觉自动转写：`stt_watch start` 打开 `autoTranscribe`，默认监听 `listen.chunk`；
+  配合 `eventDelivery: archive` 时结果只进「转写」页与事件库，不每句都叫醒桌宠。
 
 ## 已知限制
 
-- **不采集、不监听、不流式**：没有麦克风、没有实时接口，一次只处理一个完整文件；
+- **不采集、不流式**：没有麦克风、没有实时接口，一次只处理一个完整文件；
   「现在屋里有什么声音」这类要求不成立——得先有音频文件或附件。
+  自动转写读的是别的事件里已经切好的音频附件，切分与采集不归它。
 - **不复制源音频**：记录里只有来源与元数据；源文件删了，文字仍在，但没法再「重听」。
 - 回执只带文字，不产 blob；播放、发送都是别的工具的事。
 - 单段音频 ≤ 5 分钟、编码后 ≤ 10MB 是接口限制；回执文字超 6000 字符截断，记录里也最多存 20000 字符。

@@ -100,6 +100,7 @@ const config = await import(pathToFileURL(join(pkgDir, 'src', 'config.js')).href
 function makeWorld(overrides = {}, opts = {}) {
   const cfg = { ...def.defaults(), enabled: true, ...overrides };
   const stored = [];
+  const persisted = [];
   const world = def.create({
     cfg,
     dataDir: opts.dataDir ?? join(scratch, 'data'),
@@ -107,9 +108,44 @@ function makeWorld(overrides = {}, opts = {}) {
     packageDir: pkgDir,
     secret: () => (opts.key === undefined ? 'sk-test' : opts.key),
     storeSecret: (name, value) => stored.push([name, value]),
+    persist: (patch) => persisted.push(structuredClone(patch)),
   });
   world.__stored = stored;
+  world.__persisted = persisted;
   return world;
+}
+
+/** 事件库 + pushEvent 的假宿主；pushEvent 像 Core 一样补游标。 */
+function makeHost(initial = [], blobs = {}) {
+  const all = [...initial];
+  const events = [];
+  const pushed = [];
+  const host = {
+    store: {
+      latestCursor: () => (all.length ? all[all.length - 1].cursor : 0),
+      range: ({ fromCursor = 0, limit = 20 } = {}) => all.filter((one) => one.cursor >= fromCursor).slice(0, limit),
+    },
+    pushEvent: async (e, opts) => {
+      events.push(e);
+      const full = { ...e, cursor: (all.length ? all[all.length - 1].cursor : 0) + 1 };
+      all.push(full);
+      pushed.push({ event: e, opts, stored: full });
+      return full;
+    },
+    blob: (handle) => blobs[handle] ?? null,
+    log: { info() {}, warn() {} },
+  };
+  // 既是宿主本身，也带 events / pushed / add：`const { host, events } = makeHost()` 照旧能用。
+  return Object.assign(host, {
+    host,
+    events,
+    pushed,
+    add(event) {
+      const full = { ...event, cursor: (all.length ? all[all.length - 1].cursor : 0) + 1 };
+      all.push(full);
+      return full;
+    },
+  });
 }
 
 /** 造一个能放音频文件的工作区。 */
@@ -159,7 +195,7 @@ try {
   });
 
   check('describe 与 describe.json 一致，实例工具都在声明里', () => {
-    assert(def.describe && Array.isArray(def.describe.tools) && def.describe.tools.length === 1, '定义缺 describe.tools');
+    assert(def.describe && Array.isArray(def.describe.tools) && def.describe.tools.length === 2, '定义缺 describe.tools');
     assert(Array.isArray(def.describe.events), '定义缺 describe.events');
     const file = JSON.parse(readFileSync(join(pkgDir, 'describe.json'), 'utf8'));
     eq(stable(file), stable(JSON.parse(JSON.stringify(def.describe))), 'describe.json 与代码里的 describe 不一致');
@@ -198,10 +234,10 @@ try {
   // -------------------------------------------------------------------------
   console.log('World 与工具');
 
-  check('工具只有一个 stt_transcribe，声明齐全', () => {
+  check('stt_transcribe 与 stt_watch，声明齐全', () => {
     const world = makeWorld();
     const tools = world.tools();
-    eq(tools.length, 1, '工具数量');
+    eq(tools.length, 2, '工具数量');
     const tool = tools[0];
     eq(tool.name, 'stt_transcribe', '工具名');
     assert(Array.isArray(tool.tags) && tool.tags.includes('read'), 'tags 该是 read');
@@ -211,6 +247,12 @@ try {
     assert(tool.parameters.properties?.note, '缺 note 参数');
     assert(tool.parameters.properties?.language, '缺 language 参数');
     assert(tool.parameters.properties?.context, '缺 context 参数');
+    const watch = tools[1];
+    eq(watch.name, 'stt_watch', '监听工具名');
+    assert(Array.isArray(watch.tags) && watch.tags.includes('act'), 'watch tags');
+    eq(watch.parameters.required?.[0], 'action', 'watch required[0]');
+    assert(watch.parameters.properties?.events, '缺 events 参数');
+    assert(watch.parameters.properties?.eventDelivery, '缺 eventDelivery 参数');
   });
 
   check('面板与配置组声明', () => {
@@ -639,10 +681,7 @@ try {
   await checkAsync('句柄输入：走宿主 blob；解析不了要给出人话', async () => {
     const body = wav.sampleWav(0.3);
     const world = makeWorld({ model: 'qwen-audio-3.1-asr-flash' }, { dataDir: join(scratch, 'data-b') });
-    const host = {
-      blob: (h) => (h === 'mem:ok.wav' ? { bytes: new Uint8Array(body), mime: 'audio/wav' } : null),
-      log: {},
-    };
+    const { host } = makeHost([], { 'mem:ok.wav': { bytes: new Uint8Array(body), mime: 'audio/wav' } });
     await world.start(host);
     installFetch(() => jsonRes({ output: { text: '来自句柄。' } }));
     try {
@@ -717,19 +756,6 @@ try {
 
   // -------------------------------------------------------------------------
   console.log('异步协议');
-
-  function makeHost() {
-    const events = [];
-    const host = {
-      pushEvent: async (e) => {
-        events.push(e);
-        return { ...e, cursor: events.length };
-      },
-      blob: () => null,
-      log: { info() {}, warn() {} },
-    };
-    return { host, events };
-  }
 
   function makeAsyncWorld(dataDir, botDir, overrides = {}) {
     return new mod.SttWorld({
@@ -1022,6 +1048,149 @@ try {
       await world.stop();
     } finally {
       restoreFetch();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  console.log('监听事件音频');
+
+  const makeWatchWorld = (dataDir, botDir, overrides = {}) => new mod.SttWorld({
+    cfg: { ...def.defaults(), enabled: true, ...overrides },
+    dataDir,
+    botDir,
+    secret: () => 'sk-test',
+    storeSecret: () => {},
+    persist: () => {},
+    scanMs: 20,
+  });
+
+  const asrText = (text) => (u) => {
+    if (u.endsWith(ASR_PATH)) {
+      return jsonRes({ output: { choices: [{ message: { content: [{ type: 'text', text }] } }] } });
+    }
+    throw new Error(`没料到的请求：${u}`);
+  };
+
+  await checkAsync('stt_watch 读状态、开关与事件去向都写回配置', async () => {
+    const world = makeWorld();
+    const watch = world.tools()[1];
+    const status = await watch.handler({ action: 'status' }, {});
+    assert(status.text.includes('自动转写：off') && status.text.includes('listen.chunk') && status.text.includes('model'), status.text);
+    const started = await watch.handler({ action: 'start', events: 'listen.chunk, other.audio' }, {});
+    assert(!started.failed, started.text);
+    eq(world.cfg.autoTranscribe, true, 'autoTranscribe');
+    eq(world.cfg.watchEvents, 'listen.chunk, other.audio', 'watchEvents');
+    const set = await watch.handler({ action: 'set', eventDelivery: 'archive' }, {});
+    assert(!set.failed, set.text);
+    eq(world.cfg.eventDelivery, 'archive', 'eventDelivery');
+    eq(world.cfg.autoTranscribe, true, 'set 不该改开关');
+    eq(JSON.stringify(world.__persisted), JSON.stringify([
+      { autoTranscribe: true, watchEvents: 'listen.chunk, other.audio' },
+      { eventDelivery: 'archive' },
+    ]), 'persist patch');
+    const stopped = await watch.handler({ action: 'stop' }, {});
+    assert(!stopped.failed, stopped.text);
+    eq(world.cfg.autoTranscribe, false, 'stop');
+    const bad = await watch.handler({ action: 'set', eventDelivery: 'nope' }, {});
+    assert(bad.failed, '非法 eventDelivery 应当失败');
+    const empty = await watch.handler({ action: 'set' }, {});
+    assert(empty.failed, 'set 不给参数应当失败');
+  });
+
+  await checkAsync('监听：只转写打开之后的新事件，音频句柄来自事件附件', async () => {
+    const body = wav.sampleWav(0.4);
+    const blobs = {
+      'log:old.wav': { bytes: new Uint8Array(body), mime: 'audio/wav' },
+      'log:new.wav': { bytes: new Uint8Array(body), mime: 'audio/wav' },
+    };
+    const host = makeHost([{
+      cursor: 1,
+      type: 'listen.chunk',
+      source: 'listen',
+      text: '',
+      blobs: [{ handle: 'log:old.wav', mime: 'audio/wav' }],
+    }], blobs);
+    const world = makeWatchWorld(join(scratch, 'data-w1'), makeWorkspace('bot-w1'), { autoTranscribe: true });
+    installFetch(asrText('监听到的话。'));
+    try {
+      await world.start(host);
+      host.add({ type: 'listen.chunk', source: 'listen', text: '', blobs: [{ handle: 'log:new.wav', mime: 'audio/wav' }] });
+      await waitFor(() => host.events.length > 0);
+      eq(host.events[0].type, 'stt.transcript', '事件类型');
+      assert(host.events[0].text.includes('监听到的话。'), host.events[0].text);
+      assert(host.events[0].text.includes('（监听 listen.chunk）'), '事件正文没标它是监听来的');
+      eq(host.events[0].meta.source.ref, 'log:new.wav', '不该补转启动前的旧事件');
+      eq(host.pushed[0].opts.deliver, true, '默认投递到对话');
+      const list = await world.invoke('transcripts', 'list', [10]);
+      eq(list.count, 1, '只该有一条记录');
+      eq(list.items[0].note, '监听 listen.chunk', '记录名字');
+    } finally {
+      restoreFetch();
+      await world.stop();
+    }
+  });
+
+  await checkAsync('监听：按事件类型挑，archive 只落库，关着不转写', async () => {
+    const body = wav.sampleWav(0.3);
+    const blobs = { 'log:a.wav': { bytes: new Uint8Array(body), mime: 'audio/wav' } };
+    let asked = 0;
+    installFetch((u) => {
+      asked += 1;
+      return asrText('一句。')(u);
+    });
+    try {
+      const host = makeHost([], blobs);
+      const world = makeWatchWorld(join(scratch, 'data-w2'), makeWorkspace('bot-w2'), { autoTranscribe: true, eventDelivery: 'archive' });
+      await world.start(host);
+      host.add({ type: 'other.audio', source: 'other', text: '', blobs: [{ handle: 'log:a.wav', mime: 'audio/wav' }] });
+      await new Promise((done) => setTimeout(done, 80));
+      eq(asked, 0, '没监听的事件类型不该转');
+      host.add({ type: 'listen.chunk', source: 'listen', text: '', blobs: [{ handle: 'log:a.wav', mime: 'audio/wav' }] });
+      await waitFor(() => host.events.length > 0);
+      eq(host.events[0].type, 'stt.transcript', '事件类型');
+      eq(host.pushed[0].opts.deliver, false, 'archive 不该投递');
+      await world.stop();
+
+      const before = asked;
+      const host2 = makeHost([], blobs);
+      const world2 = makeWatchWorld(join(scratch, 'data-w3'), makeWorkspace('bot-w3'));
+      await world2.start(host2);
+      host2.add({ type: 'listen.chunk', source: 'listen', text: '', blobs: [{ handle: 'log:a.wav', mime: 'audio/wav' }] });
+      await new Promise((done) => setTimeout(done, 80));
+      eq(asked, before, '关着自动转写不该转');
+      await world2.stop();
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await checkAsync('监听：坏句柄只跳过这一块，接口失败后 10 秒内不再重试', async () => {
+    const body = wav.sampleWav(0.3);
+    const blobs = { 'log:good.wav': { bytes: new Uint8Array(body), mime: 'audio/wav' } };
+    const host = makeHost([], blobs);
+    const world = makeWatchWorld(join(scratch, 'data-w4'), makeWorkspace('bot-w4'), { autoTranscribe: true });
+    let asked = 0;
+    installFetch(() => {
+      asked += 1;
+      return jsonRes({ code: 'InvalidApiKey', message: 'Invalid API-key provided.' }, 401);
+    });
+    try {
+      await world.start(host);
+      host.add({ type: 'listen.chunk', source: 'listen', text: '', blobs: [{ handle: 'log:missing.wav', mime: 'audio/wav' }] });
+      await new Promise((done) => setTimeout(done, 80));
+      eq(asked, 0, '解析不出句柄不该联网');
+      eq(host.events.length, 0, '坏句柄不该发事件');
+      host.add({ type: 'listen.chunk', source: 'listen', text: '', blobs: [{ handle: 'log:good.wav', mime: 'audio/wav' }] });
+      await waitFor(() => host.events.length > 0);
+      eq(asked, 1, '接口只该被问一次');
+      eq(host.events[0].type, 'stt.transcribe-failed', '事件类型');
+      assert(host.events[0].text.includes('监听 listen.chunk'), host.events[0].text);
+      host.add({ type: 'listen.chunk', source: 'listen', text: '', blobs: [{ handle: 'log:good.wav', mime: 'audio/wav' }] });
+      await new Promise((done) => setTimeout(done, 80));
+      eq(asked, 1, '失败冷却内不再重试');
+    } finally {
+      restoreFetch();
+      await world.stop();
     }
   });
 

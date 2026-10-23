@@ -2,10 +2,13 @@
  * 语音转文本 World。
  *
  * 三件事：把一段本地音频（或 log:/mem: 句柄）交给可配置的 ASR 接口转写成文字、
- * 把文字与来源记进转写记录、把回执交给 Core。
+ * 把文字与来源记进转写记录、把结果交给 Core（工具回执，或转写事件）。
  *
- * 这里**不采集**任何声音：没有麦克风、没有实时流、没有语音切分——它是 agent 的
- * 一个批量工具（文件进、文字出）。只依赖框架契约与 Node 内置模块，服务端不需要编译。
+ * 结果可以同步交付（工具调用里等），也可以先回执、完成后发事件；打开自动转写后，
+ * 监听器还会把别的事件里的音频附件送去转写。事件去处由 eventDelivery 决定。
+ *
+ * 这里**不采集**任何声音：没有麦克风、没有实时流、没有语音切分——监听读的是事件里
+ * 已有的音频附件。只依赖框架契约与 Node 内置模块，服务端不需要编译。
  */
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -24,7 +27,7 @@ import {
   uploadBaseFor,
   uploadToDashScope,
 } from './api.js';
-import { DEFAULTS, ID, configGroup, text } from './config.js';
+import { DEFAULTS, EVENT_DELIVERIES, ID, configGroup, text, watchTypes } from './config.js';
 import { PendingTasks } from './pending.js';
 import { Transcripts } from './transcripts.js';
 import { formatKb, formatSeconds, wavInfo } from './wav.js';
@@ -33,6 +36,8 @@ const msg = (err) => (err instanceof Error ? err.message : String(err));
 const asText = (value) => (typeof value === 'string' ? value.trim() : '');
 /** 文件转写排队时间不可控，给结果的最短期限。 */
 const ASYNC_MIN_MS = 5 * 60_000;
+/** 自动转写的两次失败尝试之间至少隔这么久，免得接口挂了还逐块音频重试。 */
+const AUTO_FAIL_COOLDOWN_MS = 10000;
 const noteLabel = (entry) => (entry.note ? `（${entry.note}）` : '');
 
 function sleep(ms, signal) {
@@ -66,6 +71,20 @@ export const STT_TOOL_DECLS = [
       required: ['audio'],
     },
   },
+  {
+    name: 'stt_watch',
+    tags: ['act'],
+    description: 'Turn automatic transcription of event audio on or off, change what is watched, or read the state. start watches the configured event types (listen.chunk by default) and sends new events carrying an audio attachment to transcription; stop ends watching; set changes the watched event types or where transcript events go (archive = stored only, model = delivered to the conversation and wakes you); status shows the settings. Every change is saved to the config.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['start', 'stop', 'set', 'status'], description: 'start = watch new events and transcribe their audio; stop = end watching; set = change what is watched or where events go; status = show the settings.' },
+        events: { type: 'string', description: 'For start and set: comma-separated event types to watch, e.g. listen.chunk. For start it defaults to the configured list.' },
+        eventDelivery: { type: 'string', enum: ['archive', 'model'], description: 'For set: archive = transcript events are stored only; model = they are delivered to the conversation and wake you.' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 export class SttWorld {
@@ -79,6 +98,12 @@ export class SttWorld {
   #busy = 0;
   #lastError = '';
   #lastItemAt = '';
+  #persist = null;
+  #scanMs;
+  #watchTimer = null;
+  #watchCursor = 0;
+  #watchChain = Promise.resolve();
+  #autoFailedAt = 0;
 
   constructor(opts = {}) {
     this.id = ID;
@@ -89,6 +114,8 @@ export class SttWorld {
     this.storeSecret = typeof opts.storeSecret === 'function' ? opts.storeSecret : () => {};
     this.language = 'zh';
     this.#pollMs = Number(opts.pollMs) > 0 ? Math.max(5, Number(opts.pollMs)) : 5000;
+    this.#persist = typeof opts.persist === 'function' ? opts.persist : null;
+    this.#scanMs = Number.isFinite(Number(opts.scanMs)) && Number(opts.scanMs) >= 10 ? Number(opts.scanMs) : 1000;
   }
 
   // -------------------------------------------------------------------------
@@ -234,10 +261,10 @@ export class SttWorld {
   // -------------------------------------------------------------------------
 
   tools() {
-    return [{
-      ...STT_TOOL_DECLS[0],
-      handler: async (args, ctx) => this.#transcribe(args ?? {}, ctx),
-    }];
+    return [
+      { ...STT_TOOL_DECLS[0], handler: async (args, ctx) => this.#transcribe(args ?? {}, ctx) },
+      { ...STT_TOOL_DECLS[1], handler: async (args) => this.#watchAction(args ?? {}) },
+    ];
   }
 
   /** 音频上限（字节）：raw 文件大小；base64 后约 ×1.4。 */
@@ -404,6 +431,11 @@ export class SttWorld {
     const configured = this.#str('delivery');
     if (configured === 'wait' || configured === 'event') return configured;
     return this.#protocol() === 'dashscope-async' ? 'event' : 'wait';
+  }
+
+  /** `worlds.stt.eventDelivery`：model = 投递到模型事件流；archive = 只落事件库。 */
+  #eventDelivery() {
+    return this.#str('eventDelivery') === 'archive' ? 'archive' : 'model';
   }
 
   /** 同步形态（dashscope / openai）一次请求，顺手落记录。 */
@@ -633,7 +665,7 @@ export class SttWorld {
     };
   }
 
-  async #runSyncJob(entry, call) {
+  async #runSyncJob(entry, call, onFailed = null) {
     try {
       const done = await call();
       this.#pendingFor().remove(entry.id);
@@ -643,7 +675,9 @@ export class SttWorld {
         itemId: done.item?.id ?? '',
       });
     } catch (err) {
-      this.#finishFailed(entry, err instanceof SttApiError ? err.message : msg(err));
+      const detail = err instanceof SttApiError ? err.message : msg(err);
+      onFailed?.(detail);
+      this.#finishFailed(entry, detail);
     }
   }
 
@@ -780,13 +814,191 @@ export class SttWorld {
           seconds: meta.seconds ?? null,
           itemId: meta.itemId ?? '',
         },
-      }, { trigger: 'debounce' });
+      }, { deliver: this.#eventDelivery() === 'model', trigger: 'debounce' });
       sent?.catch?.((err) => host.log?.warn?.('语音转文本：事件没送出去', {
         taskId: entry.taskId,
         detail: msg(err),
       }));
     } catch (err) {
       host.log?.warn?.('语音转文本：事件没送出去', { taskId: entry.taskId, detail: msg(err) });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 监听事件音频
+  // -------------------------------------------------------------------------
+
+  /** 当前要监听的事件类型；空集合表示不转写。 */
+  #watchTypes() {
+    return new Set(watchTypes(this.#raw('watchEvents')));
+  }
+
+  #watchSays() {
+    const types = watchTypes(this.#raw('watchEvents'));
+    const bits = [
+      `自动转写：${this.#bool('autoTranscribe') ? 'on' : 'off'}`,
+      `监听：${types.join(', ') || '（空）'}`,
+      `事件去向：${this.#eventDelivery()}`,
+    ];
+    if (this.#busy) bits.push(`在途 ${this.#busy}`);
+    return bits.join(' · ');
+  }
+
+  /** 改监听相关配置；写盘失败只回报，不改内存。 */
+  #applyConfig(patch) {
+    try {
+      this.#persist?.(patch);
+    } catch (err) {
+      return `配置没写进去：${msg(err)}`;
+    }
+    for (const [key, value] of Object.entries(patch)) this.cfg[key] = value;
+    return '';
+  }
+
+  #watchAction(args) {
+    const action = asText(args.action) || 'status';
+    if (action === 'status') return { text: this.#watchSays() };
+    if (action !== 'start' && action !== 'stop' && action !== 'set') {
+      return { text: '[stt_watch 没执行] action 只能是 start、stop、set 或 status。', failed: true };
+    }
+
+    const patch = action === 'set' ? {} : { autoTranscribe: action === 'start' };
+    if (action !== 'stop' && args.events !== undefined) {
+      const types = watchTypes(args.events);
+      if (!types.length) return { text: '[stt_watch 没执行] events 至少要有一个事件类型。', failed: true };
+      patch.watchEvents = types.join(', ');
+    }
+    if (args.eventDelivery !== undefined) {
+      const route = asText(args.eventDelivery);
+      if (!EVENT_DELIVERIES.includes(route)) return { text: '[stt_watch 没执行] eventDelivery 只能是 archive 或 model。', failed: true };
+      patch.eventDelivery = route;
+    }
+    if (action === 'set' && Object.keys(patch).length === 0) {
+      return { text: '[stt_watch 没执行] set 需要给 events 或 eventDelivery。', failed: true };
+    }
+
+    const error = this.#applyConfig(patch);
+    if (error) return { text: `[stt_watch 失败] ${error}`, failed: true };
+    // 打开、关上或换监听列表都不补转旧事件：游标从现在开始。
+    this.#watchCursor = this.#host?.store?.latestCursor?.() ?? this.#watchCursor;
+    const verb = action === 'start' ? '开始监听' : action === 'stop' ? '停止监听' : '已更新监听';
+    return { text: `${verb}；${this.#watchSays()}` };
+  }
+
+  /** 扫一遍事件库；关着自动转写时只把游标推到最新。 */
+  #scanWatched() {
+    const host = this.#host;
+    if (!host) return;
+    try {
+      if (!this.#bool('autoTranscribe')) {
+        this.#watchCursor = host.store.latestCursor();
+        return;
+      }
+      const types = this.#watchTypes();
+      if (!types.size) {
+        this.#watchCursor = host.store.latestCursor();
+        return;
+      }
+      const events = host.store.range({ fromCursor: this.#watchCursor + 1, limit: 20 });
+      for (const event of events) {
+        this.#watchCursor = Math.max(this.#watchCursor, event.cursor);
+        if (!types.has(event.type)) continue;
+        const ref = this.#audioRefOf(event);
+        if (!ref) continue;
+        void this.#queueWatch(() => this.#submitWatched(event, ref));
+      }
+    } catch (err) {
+      this.#lastError = `${new Date().toISOString()} 读事件失败：${msg(err)}`;
+    }
+  }
+
+  /** 事件里的音频引用：优先音频附件句柄，其次 meta.handle，最后 meta.path。 */
+  #audioRefOf(event) {
+    const blobs = Array.isArray(event.blobs) ? event.blobs : [];
+    const blob = blobs.find((one) => one
+      && (/^audio\//i.test(String(one.mime ?? '')) || /\.(wav|mp3|m4a|ogg|opus|flac|aac|amr|webm|pcm)$/i.test(String(one.name ?? ''))));
+    if (blob?.handle) return blob.handle;
+    const handle = typeof event.meta?.handle === 'string' ? event.meta.handle.trim() : '';
+    if (handle) return handle;
+    return typeof event.meta?.path === 'string' ? event.meta.path.trim() : '';
+  }
+
+  /** 一块音频一个任务，按到的顺序排队，避免并发打接口。 */
+  #queueWatch(task) {
+    const run = () => task();
+    const result = this.#watchChain.then(run, run);
+    this.#watchChain = result.then(() => {}, () => {});
+    return result;
+  }
+
+  async #submitWatched(event, ref) {
+    const host = this.#host;
+    if (!host) return;
+    if (Date.now() - this.#autoFailedAt < AUTO_FAIL_COOLDOWN_MS) return;
+    const protocol = this.#protocol();
+    const key = this.apiKey();
+    const model = this.#str('model');
+    if ((protocol !== 'openai' && !key) || !model) {
+      this.#autoFailedAt = Date.now();
+      const detail = model ? `没有配置 ${this.#str('apiKeySecret')}` : '没有模型';
+      this.#lastError = `${new Date().toISOString()} 自动转写未就绪：${detail}`;
+      host.log?.warn?.('自动转写未就绪', { detail });
+      return;
+    }
+
+    let audio;
+    try {
+      audio = this.#resolveAudio(ref);
+    } catch (err) {
+      // 单块音频的问题（句柄没了、超限、认不出格式）只跳过这一块，不拦后面的事件。
+      this.#lastError = `${new Date().toISOString()} 自动转写没提交：${msg(err)}`;
+      host.log?.warn?.('自动转写没提交', { detail: msg(err), type: event.type });
+      return;
+    }
+    if (protocol === 'dashscope' && !audio.format) {
+      this.#lastError = `${new Date().toISOString()} 自动转写没提交：认不出 ${audio.fileName} 的音频格式`;
+      host.log?.warn?.('自动转写没提交', { detail: '认不出音频格式', type: event.type });
+      return;
+    }
+
+    const note = `监听 ${event.type}`;
+    const hints = this.#languageHints();
+    const timeoutMs = this.#num('timeoutMs', 10000, 900000);
+    this.#busy += 1;
+    try {
+      if (protocol === 'dashscope-async') {
+        await this.#asyncEvent({ audio, model, key, hints, note, timeoutMs });
+        return;
+      }
+      const entry = this.#newPending({
+        kind: 'request',
+        model,
+        note,
+        audio,
+        hints,
+        deadlineMs: Math.max(timeoutMs, ASYNC_MIN_MS),
+      });
+      this.#emit({ t: 'pending', task: this.#taskView(entry) });
+      await this.#runSyncJob(entry, () => this.#callSync({
+        protocol,
+        baseUrl: this.#str('baseUrl'),
+        key,
+        model,
+        audio,
+        hints,
+        context: this.#str('context'),
+        note,
+        timeoutMs,
+      }), () => {
+        this.#autoFailedAt = Date.now();
+      });
+    } catch (err) {
+      this.#autoFailedAt = Date.now();
+      const detail = err instanceof SttApiError ? err.message : msg(err);
+      this.#lastError = `${new Date().toISOString()} 自动转写失败：${detail}`;
+      this.#host?.log?.warn?.('自动转写失败', { detail, type: event.type });
+    } finally {
+      this.#busy -= 1;
     }
   }
 
@@ -908,6 +1120,10 @@ export class SttWorld {
       lastError: this.#lastError,
       lastItemAt: this.#lastItemAt,
       protocol: this.#protocol(),
+      delivery: this.#str('delivery'),
+      eventDelivery: this.#eventDelivery(),
+      autoTranscribe: this.#bool('autoTranscribe'),
+      watchEvents: watchTypes(this.#raw('watchEvents')).join(', '),
       baseUrl: env.baseUrl,
       model: env.model,
       languageHints: this.#str('languageHints'),
@@ -1071,6 +1287,10 @@ export class SttWorld {
 
   async start(host) {
     this.#host = host;
+    if (this.#watchTimer) clearInterval(this.#watchTimer);
+    this.#watchCursor = host.store.latestCursor();
+    this.#watchTimer = setInterval(() => this.#scanWatched(), this.#scanMs);
+    this.#watchTimer.unref?.();
     try {
       this.#transcriptsFor().ensure();
       this.#pendingFor().ensure();
@@ -1086,6 +1306,9 @@ export class SttWorld {
       protocol: this.#protocol(),
       key: this.apiKey() ? '已配置' : '未配置',
       pending,
+      autoTranscribe: this.#bool('autoTranscribe'),
+      watchEvents: watchTypes(this.#raw('watchEvents')).join(', '),
+      eventDelivery: this.#eventDelivery(),
     });
     if (pending) this.#schedulePoll();
   }
@@ -1094,6 +1317,10 @@ export class SttWorld {
     if (this.#pollTimer) {
       clearTimeout(this.#pollTimer);
       this.#pollTimer = null;
+    }
+    if (this.#watchTimer) {
+      clearInterval(this.#watchTimer);
+      this.#watchTimer = null;
     }
     this.#streams.clear();
     this.#host = null;
